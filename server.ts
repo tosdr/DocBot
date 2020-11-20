@@ -74,8 +74,7 @@ wss.on('connection', async (ws: any, req: any) => {
 
 	ws.ipAddress = ipAddress;
 	ws.sessionID = uuidv4();
-
-
+	
 
 	if (parseInt(process.env.VERBOSITY) >= 2) {
 		console.log(color.green("[Session Created]"), color.magenta(`<${ipAddress}>`), color.green(ws.sessionID));
@@ -103,15 +102,6 @@ wss.on('connection', async (ws: any, req: any) => {
 	let Instance = req.url;
 	let Query = url.parse(Instance, true).query;
 
-	if (Query !== null) {
-		if (("instance" in Query)) {
-			Instance = Query.instance;
-		} else {
-			Instance = Instance.substr(1);
-		}
-	} else {
-		Instance = Instance.substr(1);
-	}
 
 
 	if (("Content-Type" in Query)) {
@@ -123,9 +113,13 @@ wss.on('connection', async (ws: any, req: any) => {
 				ws.ContentType = 1;
 				break;
 			default:
-				ws.ContentType = 1;
+				ws.ContentType = 0;
 		}
+	}else{
+		ws.ContentType = 0;
 	}
+	
+	ws.send(Response.message("session", {sessionID: ws.sessionID}, ws.ContentType));
 
 
 
@@ -167,6 +161,10 @@ wss.on('connection', async (ws: any, req: any) => {
 
 				if (!("api_key" in messageJSON)) {
 					ws.send(Response.error("missing_parameter_api", 3, ws.ContentType));
+					return;
+				}
+				if (!("service" in messageJSON)) {
+					ws.send(Response.error("missing_parameter_service", 3, ws.ContentType));
 					return;
 				}
 				if (process.env.API_KEY !== messageJSON.api_key) {
@@ -212,12 +210,13 @@ wss.on('connection', async (ws: any, req: any) => {
 								}
 								let Sentences = parsed.documents[documentIndex].text.split(".\n");
 								for (var index in Sentences) {
-									if (RegularExpression.expression.test(Sentences[index])) {
+									if (RegularExpression.expression.test(Sentences[index]) && (!matches.includes(RegularExpression.caseID) && process.env.NO_DUPLICATES == "1")) {
 
 										let quoteStart = parsed.documents[documentIndex].text.indexOf(Sentences[index]);
 										let quoteEnd = quoteStart + Sentences[index].length;
 
 										ws.send(Response.match(striptags(Sentences[index]).replace(/\n/g, ''), RegularExpression.caseID, parsed.documents[documentIndex].id, quoteStart, quoteEnd, ws.ContentType))
+										matches.push(RegularExpression.caseID);
 									}
 								}
 							}
