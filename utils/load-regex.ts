@@ -33,18 +33,18 @@ export function loadRegex() {
 					console.log(color.magenta(`Loaded regex`), color.cyan(regex.expression));
 					regexs.set(regex.caseID.toString(), regex);
 				}
-
+				
+				if (errored.length >= 1 && files.length -1 == regexs.size) {
+					console.log(color.yellow('A few regex\' have failed to load: %s', color.cyan(errored.join(', '))));
+				} else if(files.length -1 == regexs.size) {
+					console.log(color.green(`Successfully loaded all ${color.cyan(regexs.size)} regex files!`));
+				}
 			}
 
 		});
+		
 	});
 
-	if (errored.length >= 1) {
-		console.log(color.yellow('A few regex\' have failed to load: %s', color.cyan(errored.join(', '))));
-		console.log(color.green(`Successfully loaded ${color.cyan(regexs.size)} commands`));
-	} else {
-		console.log(color.green(`Successfully loaded all ${color.cyan(regexs.size)} commands!`));
-	}
 
 	return regexs;
 }

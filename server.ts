@@ -4,6 +4,7 @@ import * as Response from './utils/response/index';
 import * as process from 'process';
 import * as express from 'express';
 import * as http from 'http';
+import * as fs from 'fs';
 import * as striptags from 'striptags';
 import * as https from 'https';
 import * as WebSocket from 'ws';
@@ -32,6 +33,13 @@ console.log(color.blue("********************** Initializing ********************
 export const regexs = loadRegex();
 
 
+const httpserver = http.createServer((req, res) => {
+  res.writeHead(200, { 'content-type': 'text/html' })
+  fs.createReadStream('docs/index.html').pipe(res)
+})
+
+
+
 const app = express();
 dotenv.config();
 console.log(color.green("Loaded environment variables!"));
@@ -42,11 +50,19 @@ const server = http.createServer(app);
 
 // initialize the WebSocket server instance
 const wss = new WebSocket.Server({ server });
+	console.log(color.blue("************ Starting Gateway Server ***************"));
 
-server.listen(parseInt(process.argv[2]), '0.0.0.0', () => {
-	console.log(color.green(`Gateway server started on port ${color.cyan(process.argv[2])}`));
+server.listen(parseInt(process.env.GATEWAY_PORT), '0.0.0.0', () => {
+	console.log(color.green(`Gateway server started on port ${color.cyan(process.env.GATEWAY_PORT)}`));
 	console.log(color.blue("********************** Done ************************"));
-	console.log(color.green("Server is now ready to accept connections"));
+	console.log(color.green("Gateway Server is now ready to accept connections"));
+});
+
+	console.log(color.blue("************** Starting HTTP Server ****************"));
+httpserver.listen(parseInt(process.env.HTTP_PORT), "0.0.0.0", () => {
+	console.log(color.green(`HTTP Web server started on port ${color.cyan(process.env.HTTP_PORT)}`));
+	console.log(color.blue("********************** Done ************************"));
+	console.log(color.green("HTTP Server is now ready to accept connections"));
 });
 
 wss.on('connection', async (ws: any, req: any) => {
