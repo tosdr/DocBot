@@ -11,11 +11,19 @@ import * as WebSocket from 'ws';
 import * as dotenv from 'dotenv';
 import * as color from 'chalk';
 import { v4 as uuidv4 } from 'uuid';
-import { isPrimitive } from 'util';
 import * as url from 'url';
-import { exec } from 'child_process';
 import * as JSON5 from 'json5';
-
+import * as Package from './package.json';
+import * as crypto from 'crypto';
+function objToString(obj) {
+	var str = '';
+	for (var p in obj) {
+		if (obj.hasOwnProperty(p)) {
+			str += p + '=' + obj[p] + '\n';
+		}
+	}
+	return str;
+}
 
 console.log(color.green(`
     ____             ____        __ 
@@ -23,7 +31,7 @@ console.log(color.green(`
   / / / / __ \/ ___/ __  / __ \/ __/
  / /_/ / /_/ / /__/ /_/ / /_/ / /_  
 /_____/\____/\___/_____/\____/\__/  
-              Server                        
+         Server ${Package.version}                        
 
 `));
 console.log(color.red(`BETA Project by Justin Back`));
@@ -34,15 +42,17 @@ export const regexs = loadRegex();
 
 
 const httpserver = http.createServer((req, res) => {
-  res.writeHead(200, { 'content-type': 'text/html' })
-  fs.createReadStream('docs/index.html').pipe(res)
+	res.writeHead(200, { 'content-type': 'text/html' })
+	fs.createReadStream('docs/index.html').pipe(res)
 })
 
 
 
 const app = express();
-dotenv.config();
+let dotenvparsed = dotenv.config();
 console.log(color.green("Loaded environment variables!"));
+dotenvparsed.parsed.API_KEY = "***";
+console.log(color.cyan(objToString(dotenvparsed.parsed)));
 
 
 // initialize a simple http server
@@ -50,7 +60,7 @@ const server = http.createServer(app);
 
 // initialize the WebSocket server instance
 const wss = new WebSocket.Server({ server });
-	console.log(color.blue("************ Starting Gateway Server ***************"));
+console.log(color.blue("************ Starting Gateway Server ***************"));
 
 server.listen(parseInt(process.env.GATEWAY_PORT), '0.0.0.0', () => {
 	console.log(color.green(`Gateway server started on port ${color.cyan(process.env.GATEWAY_PORT)}`));
@@ -58,7 +68,7 @@ server.listen(parseInt(process.env.GATEWAY_PORT), '0.0.0.0', () => {
 	console.log(color.green("Gateway Server is now ready to accept connections"));
 });
 
-	console.log(color.blue("************** Starting HTTP Server ****************"));
+console.log(color.blue("************** Starting HTTP Server ****************"));
 httpserver.listen(parseInt(process.env.HTTP_PORT), "0.0.0.0", () => {
 	console.log(color.green(`HTTP Web server started on port ${color.cyan(process.env.HTTP_PORT)}`));
 	console.log(color.blue("********************** Done ************************"));
@@ -72,7 +82,7 @@ wss.on('connection', async (ws: any, req: any) => {
 		return function () {
 			// Extend it to log the value for example that is passed
 			if (parseInt(process.env.VERBOSITY) >= 2) {
-				console.log(color.cyan("[Outgoing Message]"), color.magenta(`<${ipAddress}>`), color.yellow(arguments[0]));
+				console.log(color.cyan("[Outgoing Message]"), color.magenta(`<${ws.sessionID}>`), color.yellow(arguments[0]));
 			}
 			return _super.apply(this, arguments);
 		};
@@ -90,20 +100,20 @@ wss.on('connection', async (ws: any, req: any) => {
 
 	ws.ipAddress = ipAddress;
 	ws.sessionID = uuidv4();
-	
+
 
 	if (parseInt(process.env.VERBOSITY) >= 2) {
-		console.log(color.green("[Session Created]"), color.magenta(`<${ipAddress}>`), color.green(ws.sessionID));
+		console.log(color.green("[Session Created]"), color.magenta(`<${ws.sessionID}>`), color.green(ws.sessionID));
 	}
 
 	if (parseInt(process.env.VERBOSITY) >= 1) {
-		console.log(color.green("[Connection Open]"), color.magenta(`<${ipAddress}>`), color.green(req.url));
+		console.log(color.green("[Connection Open]"), color.magenta(`<${ws.sessionID}>`), color.green(req.url));
 	}
 	ws.on('close', async (code: any, reason: any) => {
 		//commands.get("close_connection")!.execute(ws, reason, wss);
 
 		if (parseInt(process.env.VERBOSITY) >= 1) {
-			console.log(color.yellow("[Connection Close]"), color.magenta(`<${ipAddress}>`), color.red(code), color.green(reason));
+			console.log(color.yellow("[Connection Close]"), color.magenta(`<${ws.sessionID}>`), color.red(code), color.green(reason));
 		}
 	});
 
@@ -131,17 +141,17 @@ wss.on('connection', async (ws: any, req: any) => {
 			default:
 				ws.ContentType = 0;
 		}
-	}else{
+	} else {
 		ws.ContentType = 0;
 	}
-	
-	ws.send(Response.message("session", {sessionID: ws.sessionID}, ws.ContentType));
+
+	ws.send(Response.message("session", { sessionID: ws.sessionID }, ws.ContentType));
 
 
 
 	ws.on('message', async (message: string) => {
 		if (parseInt(process.env.VERBOSITY) >= 2) {
-			console.log(color.cyan("[Incoming Message]"), color.magenta(`<${ipAddress}>`), color.yellow(message));
+			console.log(color.cyan("[Incoming Message]"), color.magenta(`<${ws.sessionID}>`), color.yellow(message));
 		}
 
 
@@ -197,55 +207,67 @@ wss.on('connection', async (ws: any, req: any) => {
 				}
 			}
 			try {
-				regexs.forEach((RegularExpression) => {
 
-					const options = {
-						hostname: 'edit.tosdr.org',
-						port: 443,
-						path: '/api/v1/services/' + messageJSON.service,
-						method: 'GET'
-					}
-					let str = "";
-					let matches = [];
+				console.log(color.magenta("[DocBot]"), color.magenta(`<${ws.sessionID}>`), color.green("Received Crawl Request for Service"), color.red(messageJSON.service));
 
-					const req = https.request(options, response => {
-						console.log("Sending Request");
-						response.on('data', function (chunk) {
-							console.log("Parsing Phoenix");
-							str += chunk;
-						});
 
-						//the whole response has been received, so we just print it out here
-						response.on('end', () => {
-							console.log("Phoenix parsed");
-							let parsed = JSON.parse(str);
-							for (var documentIndex in parsed.documents) {
-								console.log("Found document", parsed.documents[documentIndex].name);
-								if (parsed.documents[documentIndex].text === null) {
-									continue;
-								}
-								let Sentences = parsed.documents[documentIndex].text.split(".\n");
+				const options = {
+					hostname: 'edit.tosdr.org',
+					port: 443,
+					path: '/api/v1/services/' + messageJSON.service,
+					method: 'GET'
+				}
+				let str = "";
+				let matches = [];
+				console.log(color.magenta("[DocBot]"), color.magenta(`<${ws.sessionID}>`), color.green("Starting Request to Service"), color.magenta(messageJSON.service), color.red(crypto.createHash('md5').update(messageJSON.service).digest("hex")));
+
+				const req = https.request(options, response => {
+					response.on('data', function (chunk) {
+						if (parseInt(process.env.VERBOSITY) >= 3) {
+							console.log(color.magenta("[DocBot]"), color.magenta(`<${ws.sessionID}>`), color.green("Received Phoenix Chunk"), color.red(crypto.createHash('md5').update(chunk).digest("hex")));
+						}
+						str += chunk;
+					});
+
+					//the whole response has been received, so we just print it out here
+					response.on('end', () => {
+						console.log(color.magenta("[DocBot]"), color.magenta(`<${ws.sessionID}>`), color.cyan("Digested Phoenix Chunk(s)"), color.red(crypto.createHash('md5').update(str).digest("hex")));
+						let parsed = JSON.parse(str);
+						for (var documentIndex in parsed.documents) {
+							console.log(color.magenta("[DocBot]"), color.magenta(`<${ws.sessionID}>`), color.green("Parsed Document"), color.green(parsed.documents[documentIndex].name), color.red(crypto.createHash('md5').update(parsed.documents[documentIndex].text).digest("hex")));
+
+							if (parsed.documents[documentIndex].text === null) {
+								console.log(color.magenta("[DocBot]"), color.magenta(`<${ws.sessionID}>`), color.yellow("Skipping document, it's empty!"), color.red(crypto.createHash('md5').update(parsed.documents[documentIndex].text).digest("hex")));
+								continue;
+							}
+							let Sentences = parsed.documents[documentIndex].text.split(".\n");
+							console.log(color.magenta("[DocBot]"), color.magenta(`<${ws.sessionID}>`), color.cyan("Parsing Sentences"), color.red(crypto.createHash('md5').update(parsed.documents[documentIndex].text).digest("hex")));
+
+
+							regexs.forEach((RegularExpression) => {
 								for (var index in Sentences) {
 									if (RegularExpression.expression.test(Sentences[index]) && (!matches.includes(RegularExpression.caseID) && process.env.NO_DUPLICATES == "1")) {
 
 										let quoteStart = parsed.documents[documentIndex].text.indexOf(Sentences[index]);
 										let quoteEnd = quoteStart + Sentences[index].length;
 
+										console.log(color.magenta("[DocBot]"), color.magenta(`<${ws.sessionID}>`), color.green("I have found a match on Line"), color.magenta(index), color.green("for the case"), color.magenta(RegularExpression.caseID), color.red(crypto.createHash('md5').update(Sentences[index]).digest("hex")));
+
+
 										ws.send(Response.match(striptags(Sentences[index]).replace(/\n/g, ''), RegularExpression.caseID, parsed.documents[documentIndex].id, quoteStart, quoteEnd, ws.ContentType))
 										matches.push(RegularExpression.caseID);
 									}
 								}
-							}
-						});
-					})
+							});
+						}
+					});
+				})
 
-					req.on('error', error => {
-						console.error(error)
-					})
+				req.on('error', error => {
+					console.error(error)
+				})
 
-					req.end();
-
-				});
+				req.end();
 			} catch (error) {
 				ws.send(Response.error("error_exec", 0, ws.ContentType));
 				console.log(color.red("[ERROR]", color.magenta(`<${messageJSON.service}>`), color.yellow(error)));

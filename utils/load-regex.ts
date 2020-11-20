@@ -30,7 +30,7 @@ export function loadRegex() {
 					errored.push(file);
 					console.log(color.red(`Failed to load regex file`), color.cyan(file));
 				} else {
-					console.log(color.magenta(`Loaded regex`), color.cyan(regex.expression));
+					console.log(color.magenta(`Loaded regex`), color.cyan(regex.expression), color.red(regex.caseID));
 					regexs.set(regex.caseID.toString(), regex);
 				}
 				
