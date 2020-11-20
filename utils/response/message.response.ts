@@ -4,6 +4,8 @@ import * as JSON5 from 'json5';
 export function message(message: any, parameter: any, type: number) {
 	let data = {
 		message: message,
+		error: false,
+		code: 1,
 		parameter: parameter
 	};
 	switch (type) {

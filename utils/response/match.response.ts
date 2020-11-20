@@ -4,12 +4,16 @@ import * as JSON5 from 'json5';
 export function match(sentence: any, caseID: any, documentID: any, quoteStart: any, quoteEnd: any, type: number) {
 	let data = {
 		message: "match",
-		sentence: sentence,
-		caseID: caseID,
-		documentID: documentID,
-		quotes: {
-			start: quoteStart,
-			end: quoteEnd
+		error: false,
+		code: 1,
+		parameters: {
+			sentence: sentence,
+			caseID: caseID,
+			documentID: documentID,
+			quotes: {
+				start: quoteStart,
+				end: quoteEnd
+			},
 		}
 	};
 	switch (type) {
