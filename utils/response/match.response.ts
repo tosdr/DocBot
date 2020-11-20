@@ -1,15 +1,16 @@
 import { exec } from "child_process";
 import * as JSON5 from 'json5';
 
-export function match(sentence: any, caseID: any, documentID: any, quoteStart: any, quoteEnd: any, type: number) {
+export function match(sentence: any, caseObj: any, document: any, service: any, quoteStart: any, quoteEnd: any, type: number) {
 	let data = {
 		message: "match",
 		error: false,
 		code: 1,
 		parameters: {
 			sentence: sentence,
-			caseID: caseID,
-			documentID: documentID,
+			case: caseObj,
+			document: document,
+			service: service,
 			quotes: {
 				start: quoteStart,
 				end: quoteEnd

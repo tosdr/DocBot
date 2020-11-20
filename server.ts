@@ -250,6 +250,9 @@ publicIp.v4().then((ip) => {
 						response.on('end', () => {
 							console.log(color.magenta("[DocBot]"), color.magenta(`<${ws.sessionID}>`), color.cyan("Digested Phoenix Chunk(s)"), color.red(crypto.createHash('md5').update(str).digest("hex")));
 							let parsed = JSON.parse(str);
+							let timeout = setTimeout(() => {
+								ws.send(Response.message("finished", null, ws.ContentType));
+							}, 5000);
 							for (var documentIndex in parsed.documents) {
 								console.log(color.magenta("[DocBot]"), color.magenta(`<${ws.sessionID}>`), color.green("Parsed Document"), color.green(parsed.documents[documentIndex].name), color.red(crypto.createHash('md5').update(parsed.documents[documentIndex].text).digest("hex")));
 
@@ -270,9 +273,24 @@ publicIp.v4().then((ip) => {
 
 											console.log(color.magenta("[DocBot]"), color.magenta(`<${ws.sessionID}>`), color.green("I have found a match on Line"), color.magenta(index), color.green("for the case"), color.magenta(RegularExpression.caseID), color.red(crypto.createHash('md5').update(Sentences[index]).digest("hex")));
 
-
-											ws.send(Response.match(striptags(Sentences[index]).replace(/\n/g, ''), RegularExpression.caseID, parsed.documents[documentIndex].id, quoteStart, quoteEnd, ws.ContentType))
+											clearTimeout(timeout);
+											ws.send(Response.match(
+												striptags(Sentences[index]).replace(/\n/g, ''),
+												RegularExpression.caseID,
+												parsed.documents[documentIndex],
+												{
+													name: parsed.name,
+													url: parsed.url,
+													rating: parsed.rating
+												},
+												quoteStart,
+												quoteEnd,
+												ws.ContentType
+											));
 											matches.push(RegularExpression.caseID);
+											timeout = setTimeout(() => {
+												ws.send(Response.message("finished", null, ws.ContentType));
+											}, 5000);
 										}
 									}
 								});

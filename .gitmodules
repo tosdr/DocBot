@@ -1,0 +1,3 @@
+[submodule "discordbot"]
+	path = discordbot
+	url = https://github.com/JustinBack/DocBot-Discord
