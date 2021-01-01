@@ -1,6 +1,7 @@
 import { Regex } from '../models';
 
 module.exports = {
-	expression: new RegExp("^((?=.*personal)|(?=.*user))((?=.*marketing)|(?=.*information))", "i"),
-	caseID: 336
+	expression: new RegExp("^((?=.*personal)|((?=.*user)(?=.*information)))(?=.*market)", "i"),
+	caseID: 336,
+	name: "This service may use your personal information for marketing purposes"
 } as Regex;

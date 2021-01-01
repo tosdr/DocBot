@@ -1,86 +1,87 @@
-  <!DOCTYPE html>
-  <meta charset="utf-8" />
-  <title>DocBot Crawler Test</title>
-  <script language="javascript" type="text/javascript">
+<!DOCTYPE html>
+<meta charset="utf-8" />
+<title>DocBot Crawler Test</title>
+<script language="javascript" type="text/javascript">
 
   var output;
   var service;
   var apikey;
 
-  function init()
-  {
+  function init() {
     output = document.getElementById("output");
-	output.innerHTML = "";
+    output.innerHTML = "";
     testWebSocket();
   }
 
-  function testWebSocket()
-  {
-    websocket = new WebSocket("ws://"+ document.getElementById("server").value);
-    websocket.onopen = function(evt) { onOpen(evt) };
-    websocket.onclose = function(evt) { onClose(evt) };
-    websocket.onmessage = function(evt) { onMessage(evt) };
-    websocket.onerror = function(evt) { onError(evt) };
-  }
-  
-  function crawl(){
-		service = document.getElementById("service").value;
-		apikey = document.getElementById("apikey").value;
-		
-		var construct = {
-			"api_key": apikey,
-			"service": service
-		}
-		
-		doSend(JSON.stringify(construct));
+  function testWebSocket() {
+    websocket = new WebSocket("ws://" + document.getElementById("server").value);
+    websocket.onopen = function (evt) { onOpen(evt) };
+    websocket.onclose = function (evt) { onClose(evt) };
+    websocket.onmessage = function (evt) { onMessage(evt) };
+    websocket.onerror = function (evt) { onError(evt) };
   }
 
-  function onOpen(evt)
-  {
+  function crawl() {
+
+    output.innerHTML = "";
+    service = document.getElementById("service").value;
+    apikey = document.getElementById("apikey").value;
+
+    var construct = {
+      "api_key": apikey,
+      "service": service
+    }
+
+    doSend(JSON.stringify(construct));
+  }
+
+  function onOpen(evt) {
     writeToScreen("CONNECTED TO DocBot Server");
   }
 
-  function onClose(evt)
-  {
+  function onClose(evt) {
     writeToScreen("DISCONNECTED");
   }
 
-  function onMessage(evt)
-  {
-    writeToScreen('<span style="color: blue;">RESPONSE: ' + evt.data+'</span>');
+  function onMessage(evt) {
+    let data = JSON.parse(evt.data);
+    if (data.message == "match") {
+      writeToScreen('<span style="color: blue;">Match found!</span>');
+      writeToScreen('<span style="color: brown;"><a target="_blank" href="https://edit.tosdr.org/cases/' + data.parameters.case.caseID + '">'+data.parameters.case.name+'</a></span>');
+      writeToScreen('<span style="color: red;">' + data.parameters.sentence + '</span>');
+      writeToScreen('<span style="color: green;">--------------</span>');
+    }
+
   }
 
-  function onError(evt)
-  {
+  function onError(evt) {
     writeToScreen('<span style="color: red;">ERROR:</span> ' + evt.data);
   }
 
-  function doSend(message)
-  {
+  function doSend(message) {
     writeToScreen("SENT: " + message);
     websocket.send(message);
   }
 
-  function writeToScreen(message)
-  {
+  function writeToScreen(message) {
     var pre = document.createElement("p");
     pre.style.wordWrap = "break-word";
     pre.innerHTML = message;
     output.appendChild(pre);
   }
 
-  </script>
+</script>
 
-  <h2>DocBot Crawler Test</h2>
-  <label>DocBot Server:</label><br>
-  <input type="text" id="server" value="192.168.178.79:6001"/><br>
-  
-  <button id="connect" onclick="init();">Connect to DocBot Server</button><br><br>
-  
-  <label>API Key:</label><br>
-  <input type="password" id="apikey"/><br><br>
-  <label>Service ID:</label><br>
-  <input type="number" id="service"/><br><br>
-  <button id="connect" onclick="crawl();">Crawl Service</button><br><br>
+<h2>DocBot Crawler</h2>
+<label>DocBot Server:</label><br>
+<input type="text" id="server" value="87.78.131.160:6005" /><br>
 
-  <div id="output">PLEASE CONNECT TO A DocBot Server FIRST</div>
+<button id="connect" onclick="init();">Connect to DocBot Server</button><br><br>
+
+<label>API Key:</label><br>
+<input type="password" id="apikey" /><br><br>
+<label>Service ID:</label><br>
+<input type="number" id="service" /><br><br>
+<button id="connect" onclick="crawl();">Crawl Service</button><br><br>
+
+<div id="output">PLEASE CONNECT TO A DocBot Server FIRST</div>

@@ -268,6 +268,7 @@ publicIp.v4().then((ip) => {
 									for (var index in Sentences) {
 										if (RegularExpression.expression.test(Sentences[index]) && (!matches.includes(RegularExpression.caseID) && process.env.NO_DUPLICATES == "1")) {
 
+
 											let quoteStart = parsed.documents[documentIndex].text.indexOf(Sentences[index]);
 											let quoteEnd = quoteStart + Sentences[index].length;
 
@@ -276,7 +277,7 @@ publicIp.v4().then((ip) => {
 											clearTimeout(timeout);
 											ws.send(Response.match(
 												striptags(Sentences[index]).replace(/\n/g, ''),
-												RegularExpression.caseID,
+												RegularExpression,
 												parsed.documents[documentIndex],
 												{
 													name: parsed.name,
