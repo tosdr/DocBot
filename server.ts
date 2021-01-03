@@ -58,7 +58,6 @@ publicIp.v4().then((ip) => {
 	console.log(color.cyan(objToString(dotenvparsed.parsed)));
 
 
-	// initialize a simple http server
 	const server = http.createServer(app);
 
 	// initialize the WebSocket server instance

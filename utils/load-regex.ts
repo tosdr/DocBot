@@ -24,6 +24,8 @@ export function loadRegex() {
 
 			if (stats.isFile()) {
 
+				console.log("Loading", file);
+
 				const regex = require(`../regex/${file}`) as Regex;
 
 				if (!regex) {

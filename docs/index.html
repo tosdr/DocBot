@@ -1,87 +1,99 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <meta charset="utf-8" />
 <title>DocBot Crawler Test</title>
 <script language="javascript" type="text/javascript">
 
-  var output;
-  var service;
-  var apikey;
+    var output;
+    var service;
+    var apikey;
 
-  function init() {
-    output = document.getElementById("output");
-    output.innerHTML = "";
-    testWebSocket();
-  }
-
-  function testWebSocket() {
-    websocket = new WebSocket("ws://" + document.getElementById("server").value);
-    websocket.onopen = function (evt) { onOpen(evt) };
-    websocket.onclose = function (evt) { onClose(evt) };
-    websocket.onmessage = function (evt) { onMessage(evt) };
-    websocket.onerror = function (evt) { onError(evt) };
-  }
-
-  function crawl() {
-
-    output.innerHTML = "";
-    service = document.getElementById("service").value;
-    apikey = document.getElementById("apikey").value;
-
-    var construct = {
-      "api_key": apikey,
-      "service": service
+    function init() {
+        output = document.getElementById("output");
+        output.innerHTML = "";
+        testWebSocket();
     }
 
-    doSend(JSON.stringify(construct));
-  }
-
-  function onOpen(evt) {
-    writeToScreen("CONNECTED TO DocBot Server");
-  }
-
-  function onClose(evt) {
-    writeToScreen("DISCONNECTED");
-  }
-
-  function onMessage(evt) {
-    let data = JSON.parse(evt.data);
-    if (data.message == "match") {
-      writeToScreen('<span style="color: blue;">Match found!</span>');
-      writeToScreen('<span style="color: brown;"><a target="_blank" href="https://edit.tosdr.org/cases/' + data.parameters.case.caseID + '">'+data.parameters.case.name+'</a></span>');
-      writeToScreen('<span style="color: red;">' + data.parameters.sentence + '</span>');
-      writeToScreen('<span style="color: green;">--------------</span>');
+    function testWebSocket() {
+        websocket = new WebSocket("ws://" + document.getElementById("server").value);
+        websocket.onopen = function (evt) { onOpen(evt) };
+        websocket.onclose = function (evt) { onClose(evt) };
+        websocket.onmessage = function (evt) { onMessage(evt) };
+        websocket.onerror = function (evt) { onError(evt) };
     }
 
-  }
+    function crawl() {
 
-  function onError(evt) {
-    writeToScreen('<span style="color: red;">ERROR:</span> ' + evt.data);
-  }
+        output.innerHTML = "";
+        service = document.getElementById("service").value;
+        apikey = document.getElementById("apikey").value;
 
-  function doSend(message) {
-    writeToScreen("SENT: " + message);
-    websocket.send(message);
-  }
+        var construct = {
+            "api_key": apikey,
+            "service": service
+        }
 
-  function writeToScreen(message) {
-    var pre = document.createElement("p");
-    pre.style.wordWrap = "break-word";
-    pre.innerHTML = message;
-    output.appendChild(pre);
-  }
+        doSend(JSON.stringify(construct));
+    }
+
+    function onOpen(evt) {
+        writeToScreen("CONNECTED TO DocBot Server");
+    }
+
+    function onClose(evt) {
+        writeToScreen("DISCONNECTED");
+    }
+
+    function onMessage(evt) {
+        let data = JSON.parse(evt.data);
+        if (data.message == "match") {
+            writeToScreen('<span style="color: blue;">Match found!</span>');
+            writeToScreen('<span style="color: brown;"><a target="_blank" href="https://edit.tosdr.org/cases/' + data.parameters.case.caseID + '">' + data.parameters.case.name + ' . ' + data.parameters.case.caseID + '</a></span>');
+            writeToScreen('<span style="color: red;">' + data.parameters.sentence + '</span>');
+            writeToScreen('<span style="color: green;">--------------</span>');
+        }
+
+    }
+
+    function onError(evt) {
+        writeToScreen('<span style="color: red;">ERROR:</span> ' + evt.data);
+    }
+
+    function doSend(message) {
+        writeToScreen("SENT: " + message);
+        websocket.send(message);
+    }
+
+    function writeToScreen(message) {
+        var pre = document.createElement("p");
+        pre.style.wordWrap = "break-word";
+        pre.innerHTML = message;
+        output.appendChild(pre);
+    }
 
 </script>
 
 <h2>DocBot Crawler</h2>
-<label>DocBot Server:</label><br>
-<input type="text" id="server" value="87.78.131.160:6005" /><br>
+<label>DocBot Server:</label>
+<br>
+<input type="text" id="server" value="87.78.131.160:6005" />
+<br>
 
-<button id="connect" onclick="init();">Connect to DocBot Server</button><br><br>
+<button id="connect" onclick="init();">Connect to DocBot Server</button>
+<br>
+<br>
 
-<label>API Key:</label><br>
-<input type="password" id="apikey" /><br><br>
-<label>Service ID:</label><br>
-<input type="number" id="service" /><br><br>
-<button id="connect" onclick="crawl();">Crawl Service</button><br><br>
+<label>API Key:</label>
+<br>
+<input type="password" id="apikey" />
+<br>
+<br>
+<label>Service ID:</label>
+<br>
+<input type="number" id="service" />
+<br>
+<br>
+<button id="connect" onclick="crawl();">Crawl Service</button>
+<br>
+<br>
 
 <div id="output">PLEASE CONNECT TO A DocBot Server FIRST</div>
