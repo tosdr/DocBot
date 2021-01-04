@@ -1,0 +1,16 @@
+kind: pipeline
+name: default
+
+steps:
+- name: Install Packages
+  image: node
+  commands:
+  - npm install --save-dev
+- name: Compile Typescript
+  image: node
+  commands:
+  - ./node_modules/.bin/tsc
+- name: Clean Build
+  image: node
+  commands:
+  - ./node_modules/.bin/tsc --build --clean
