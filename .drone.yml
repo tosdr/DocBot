@@ -24,7 +24,7 @@ steps:
         from_secret: DISCORD_TOKEN
     message: >
       {{#success build.status}}
-        build {{build.number}} succeeded. Good job.
+        Build {{build.number}} by {{build.author}} succeeded.\n\n{{build.message}}
       {{else}}
-        build {{build.number}} failed.
+        Build {{build.number}} by {{build.author}} failed.\n\n{{build.message}}
       {{/success}}
