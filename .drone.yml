@@ -24,7 +24,12 @@ steps:
         from_secret: DISCORD_TOKEN
     message: >
       {{#success build.status}}
-        Build {{build.number}} by {{build.author}} succeeded.\n\n{{build.message}}
+        Build {{build.number}} by {{build.author}} succeeded.
+        {{build.message}}
       {{else}}
-        Build {{build.number}} by {{build.author}} failed.\n\n{{build.message}}
+        Build {{build.number}} by {{build.author}} failed.
+        {{build.message}}
       {{/success}}
+
+node:
+  os: linux
