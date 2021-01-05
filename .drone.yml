@@ -1,0 +1,30 @@
+kind: pipeline
+name: default
+
+steps:
+- name: Install Packages
+  image: node
+  commands:
+  - npm install --save-dev
+- name: Compile Typescript
+  image: node
+  commands:
+  - ./node_modules/.bin/tsc
+- name: Clean Build
+  image: node
+  commands:
+  - ./node_modules/.bin/tsc --build --clean
+
+- name: discord notification
+  image: appleboy/drone-discord
+  settings:
+    webhook_id:
+        from_secret: DISCORD_ID
+    webhook_token:
+        from_secret: DISCORD_TOKEN
+    message: >
+      {{#success build.status}}
+        Build {{build.number}} by {{build.author}} succeeded.\n\n{{build.message}}
+      {{else}}
+        Build {{build.number}} by {{build.author}} failed.\n\n{{build.message}}
+      {{/success}}
