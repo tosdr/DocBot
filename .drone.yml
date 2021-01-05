@@ -24,10 +24,10 @@ steps:
         from_secret: DISCORD_TOKEN
     message: >
       {{#success build.status}}
-        Build {{build.number}} by {{build.author}} succeeded.
+        Build {{build.number}} succeeded {{build.link}}.
         {{build.message}}
       {{else}}
-        Build {{build.number}} by {{build.author}} failed.
+        Build {{build.number}} failed {{build.link}}.
         {{build.message}}
       {{/success}}
 
