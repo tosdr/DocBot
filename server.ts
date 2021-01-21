@@ -255,10 +255,12 @@ publicIp.v4().then((ip) => {
 							for (var documentIndex in parsed.documents) {
 								
 								if (parsed.documents[documentIndex].text === null || parsed.documents[documentIndex].text === "") {
-									console.log(color.magenta("[DocBot]"), color.magenta(`<${ws.sessionID}>`), color.yellow("Skipping document, it's empty!"), color.red(crypto.createHash('md5').update(parsed.documents[documentIndex].text).digest("hex")));
+									console.log(color.magenta("[DocBot]"), color.magenta(`<${ws.sessionID}>`), color.yellow("Skipping document, it's empty!"));
 									continue;
 								}
+
 								console.log(color.magenta("[DocBot]"), color.magenta(`<${ws.sessionID}>`), color.green("Parsed Document"), color.green(parsed.documents[documentIndex].name), color.red(crypto.createHash('md5').update(parsed.documents[documentIndex].text).digest("hex")));
+
 								let Sentences = parsed.documents[documentIndex].text.split(".\n");
 								console.log(color.magenta("[DocBot]"), color.magenta(`<${ws.sessionID}>`), color.cyan("Parsing Sentences"), color.red(crypto.createHash('md5').update(parsed.documents[documentIndex].text).digest("hex")));
 
