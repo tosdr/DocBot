@@ -1,99 +1,268 @@
-﻿<!DOCTYPE html>
-<meta charset="utf-8" />
-<title>DocBot Crawler Test</title>
-<script language="javascript" type="text/javascript">
+﻿
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Bootstrap Example</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/popper.js/1.16.0/umd/popper.min.js"></script>
+    <script src="https://maxcdn.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+</head>
+<body>
 
-    var output;
-    var service;
-    var apikey;
+    <div class="jumbotron text-center">
+        <h1>DocBot Crawler</h1>
+        <p style="color: red;" id="status">Not connected</p>
+        <div class="container">
+            <div class="input-group mb-3">
+                <div class="input-group-prepend">
+                    <span class="input-group-text">Gateway Server</span>
+                </div>
+                <input type="text" class="form-control" value="127.0.0.1:6005" placeholder="Gateway Server address" id="server">
+                <div class="input-group-append">
+                    <button id="connect" onclick="init();" class="btn btn-success" type="submit">Connect</button>
+                </div>
+            </div>
+            <div class="input-group mb-3">
+                <div class="input-group-prepend">
+                    <span class="input-group-text">API Key</span>
+                </div>
+                <input type="text" class="form-control" placeholder="Your api key" id="apikey">
+            </div>
+            <div class="input-group mb-3">
+                <div class="input-group-prepend">
+                    <span class="input-group-text">Service ID</span>
+                </div>
+                <input type="text" class="form-control" placeholder="ID of a service" id="service">
+                <div class="input-group-append">
+                    <button id="crawl" onclick="crawl();" class="btn btn-success" type="submit">Crawl Service</button>
+                </div>
+            </div>
+        </div>
+    </div>
 
-    function init() {
-        output = document.getElementById("output");
-        output.innerHTML = "";
-        testWebSocket();
-    }
+    <div class="container-fluid">
+        <div class="row">
+            <div class="col-8">
+                <h1 class="text-center">Matches</h1>
+                <table class="table table-responsive">
+                    <thead>
+                        <tr>
+                            <th>Lines</th>
+                            <th>Document</th>
+                            <th>Case</th>
+                            <th>Quote</th>
+                        </tr>
+                    </thead>
+                    <tbody id="table">
+                    </tbody>
+                </table>
+            </div>
+            <div class="col-4">
+                <h1 class="text-center">Log</h1>
+                <pre id="log"></pre>
+            </div>
+        </div>
+    </div>
 
-    function testWebSocket() {
-        websocket = new WebSocket("ws://" + document.getElementById("server").value);
-        websocket.onopen = function (evt) { onOpen(evt) };
-        websocket.onclose = function (evt) { onClose(evt) };
-        websocket.onmessage = function (evt) { onMessage(evt) };
-        websocket.onerror = function (evt) { onError(evt) };
-    }
+    <div class="modal fade" id="documentModal">
+        <div class="modal-dialog modal-xl">
+            <div class="modal-content" id="modalContent">
 
-    function crawl() {
+                <!-- Modal Header -->
+                <div class="modal-header">
+                    <h4 class="modal-title" id="documentTitle">Loading...</h4>
+                    <button type="button" class="close" data-dismiss="modal">&times;</button>
+                </div>
 
-        output.innerHTML = "";
-        service = document.getElementById("service").value;
-        apikey = document.getElementById("apikey").value;
+                <!-- Modal body -->
+                <div class="modal-body" id="documentText">
+                    Loading...
+                </div>
 
-        var construct = {
-            "api_key": apikey,
-            "service": service
+                <!-- Modal footer -->
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-danger" data-dismiss="modal">Close</button>
+                </div>
+
+            </div>
+        </div>
+    </div>
+    <script language="javascript" type="text/javascript">
+
+        function escapeHtml(unsafe) {
+            return unsafe
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
         }
 
-        doSend(JSON.stringify(construct));
-    }
+        var output;
+        var table;
+        var service;
+        var apikey;
 
-    function onOpen(evt) {
-        writeToScreen("CONNECTED TO DocBot Server");
-    }
-
-    function onClose(evt) {
-        writeToScreen("DISCONNECTED");
-    }
-
-    function onMessage(evt) {
-        let data = JSON.parse(evt.data);
-        if (data.message == "match") {
-            writeToScreen('<span style="color: blue;">Match found!</span>');
-            writeToScreen('<span style="color: brown;"><a target="_blank" href="https://edit.tosdr.org/cases/' + data.parameters.case.caseID + '">' + data.parameters.case.name + ' . ' + data.parameters.case.caseID + '</a></span>');
-            writeToScreen('<span style="color: red;">' + data.parameters.sentence + '</span>');
-            writeToScreen('<span style="color: green;">--------------</span>');
+        function init() {
+            output = document.getElementById("log");
+            table = document.getElementById("table");
+            table.innerHTML = "";
+            output.innerHTML = "";
+            initWebsocket();
         }
 
-    }
+        function initWebsocket() {
+            websocket = new WebSocket("ws://" + document.getElementById("server").value);
+            websocket.onopen = function (evt) { onOpen(evt) };
+            websocket.onclose = function (evt) { onClose(evt) };
+            websocket.onmessage = function (evt) { onMessage(evt) };
+            websocket.onerror = function (evt) { onError(evt) };
+        }
 
-    function onError(evt) {
-        writeToScreen('<span style="color: red;">ERROR:</span> ' + evt.data);
-    }
+        function crawl() {
+            service = document.getElementById("service").value;
+            apikey = document.getElementById("apikey").value;
 
-    function doSend(message) {
-        writeToScreen("SENT: " + message);
-        websocket.send(message);
-    }
+            var construct = {
+                "api_key": apikey,
+                "service": service
+            }
 
-    function writeToScreen(message) {
-        var pre = document.createElement("p");
-        pre.style.wordWrap = "break-word";
-        pre.innerHTML = message;
-        output.appendChild(pre);
-    }
+            doSend(JSON.stringify(construct));
+        }
 
-</script>
+        function onOpen(evt) {
+            writeToScreen("CONNECTED TO DocBot Server");
+            $("#status").html("Connected");
+            $("#status").prop('style', 'color: green;');
+        }
 
-<h2>DocBot Crawler</h2>
-<label>DocBot Server:</label>
-<br>
-<input type="text" id="server" value="87.78.131.160:6005" />
-<br>
+        function onClose(evt) {
+            writeToScreen("DISCONNECTED");
+            $("#status").html("Connection closed");
+            $("#status").prop('style', 'color: red;');
+        }
 
-<button id="connect" onclick="init();">Connect to DocBot Server</button>
-<br>
-<br>
+        function onMessage(evt) {
+            let data = JSON.parse(evt.data);
+            writeToScreen("RECEIVE: " + escapeHtml(evt.data));
+            if (data.message == "match") {
+                writetoTable(data.parameters);
+            }
+        }
 
-<label>API Key:</label>
-<br>
-<input type="password" id="apikey" />
-<br>
-<br>
-<label>Service ID:</label>
-<br>
-<input type="number" id="service" />
-<br>
-<br>
-<button id="connect" onclick="crawl();">Crawl Service</button>
-<br>
-<br>
+        function onError(evt) {
+            writeToScreen('<span style="color: red;">ERROR:</span> ' + evt.data);
+            $("#status").html("Connection lost");
+            $("#status").prop('style', 'color: red;');
+        }
 
-<div id="output">PLEASE CONNECT TO A DocBot Server FIRST</div>
+        function doSend(message) {
+            writeToScreen("SENT: " + message);
+            websocket.send(message);
+        }
+
+        function writeToScreen(message) {
+            var pre = document.createElement("p");
+            pre.style.wordWrap = "break-word";
+            pre.innerHTML = message;
+            output.appendChild(pre);
+        }
+        function writetoTable(match) {
+            let tr = $("<tr>");
+            $("#table").append(tr);
+            tr.append($("<td>")
+                .append($("<a>", { href: "#", text: match.quotes.start + '-' + match.quotes.end, 'data-toggle': 'modal', 'data-target': '#documentModal', 'data-match': JSON.stringify(match) })));
+
+            tr.append($("<td>")
+                .append($("<a>", { href: "https://edit.tosdr.org/documents/" + match.document.id, text: match.document.name, target: '_blank' })));
+
+            tr.append($("<td>")
+                .append($("<a>", { href: "https://edit.tosdr.org/cases/" + match.case.caseID, text: match.case.name, target: '_blank' })));
+
+            tr.append($("<td>")
+                .html(match.sentence));
+        }
+
+        $(document).ready(function () {
+            $('#documentModal').on('show.bs.modal', function (e) {
+                let match = JSON.parse($(e.relatedTarget).attr('data-match'));
+                $("#documentName").html(match.document.name);
+                $("#documentText").html(escapeHtml(match.document.text));
+                $("#documentText").highlight(match.sentence);
+                $('#documentText').animate({
+                    scrollTop: $("mark").offset().top + 'px'
+                }, 'fast');
+            });
+        });
+
+
+        jQuery.extend({
+            highlight: function (node, re, nodeName, className) {
+                if (node.nodeType === 3) {
+                    var match = node.data.match(re);
+                    if (match) {
+                        var highlight = document.createElement(nodeName || 'span');
+                        highlight.className = className || 'highlight';
+                        var wordNode = node.splitText(match.index);
+                        wordNode.splitText(match[0].length);
+                        var wordClone = wordNode.cloneNode(true);
+                        highlight.appendChild(wordClone);
+                        wordNode.parentNode.replaceChild(highlight, wordNode);
+                        return 1; //skip added node in parent
+                    }
+                } else if ((node.nodeType === 1 && node.childNodes) && // only element nodes that have children
+                    !/(script|style)/i.test(node.tagName) && // ignore script and style nodes
+                    !(node.tagName === nodeName.toUpperCase() && node.className === className)) { // skip if already highlighted
+                    for (var i = 0; i < node.childNodes.length; i++) {
+                        i += jQuery.highlight(node.childNodes[i], re, nodeName, className);
+                    }
+                }
+                return 0;
+            }
+        });
+
+        jQuery.fn.unhighlight = function (options) {
+            var settings = { className: 'highlight', element: 'span' };
+            jQuery.extend(settings, options);
+
+            return this.find(settings.element + "." + settings.className).each(function () {
+                var parent = this.parentNode;
+                parent.replaceChild(this.firstChild, this);
+                parent.normalize();
+            }).end();
+        };
+
+        jQuery.fn.highlight = function (words, options) {
+            var settings = { className: 'highlight', element: 'mark', caseSensitive: false, wordsOnly: false };
+            jQuery.extend(settings, options);
+
+            if (words.constructor === String) {
+                words = [words];
+            }
+            words = jQuery.grep(words, function (word, i) {
+                return word != '';
+            });
+            words = jQuery.map(words, function (word, i) {
+                return word.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&");
+            });
+            if (words.length == 0) { return this; };
+
+            var flag = settings.caseSensitive ? "" : "i";
+            var pattern = "(" + words.join("|") + ")";
+            if (settings.wordsOnly) {
+                pattern = "\\b" + pattern + "\\b";
+            }
+            var re = new RegExp(pattern, flag);
+
+            return this.each(function () {
+                jQuery.highlight(this, re, settings.element, settings.className);
+            });
+        };
+
+    </script>
+</body>
+</html>
