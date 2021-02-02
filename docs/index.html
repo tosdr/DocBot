@@ -193,9 +193,6 @@
                 $("#documentName").html(match.document.name);
                 $("#documentText").html(escapeHtml(match.document.text));
                 $("#documentText").highlight(match.sentence);
-                $('#documentText').animate({
-                    scrollTop: $("mark").offset().top + 'px'
-                }, 'fast');
             });
         });
 
