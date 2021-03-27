@@ -1,2 +1,2 @@
-export * from './regex.model';
+export * from './case.model';
 export * from './map.model';

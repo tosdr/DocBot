@@ -182,7 +182,7 @@
                 .append($("<a>", { href: "https://edit.tosdr.org/documents/" + match.document.id, text: match.document.name, target: '_blank' })));
 
             tr.append($("<td>")
-                .append($("<a>", { href: "https://edit.tosdr.org/cases/" + match.case.caseID, text: match.case.name, target: '_blank' })));
+                .append($("<a>", { href: "https://edit.tosdr.org/cases/" + match.case.id, text: match.case.title, target: '_blank' })));
 
             tr.append($("<td>")
                 .html(match.sentence));

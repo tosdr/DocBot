@@ -267,13 +267,13 @@ publicIp.v4().then((ip) => {
 
 								regexs.forEach((RegularExpression) => {
 									for (var index in Sentences) {
-										if (RegularExpression.expression.test(Sentences[index]) && (!matches.includes(RegularExpression.caseID) && process.env.NO_DUPLICATES == "1")) {
+										if (RegularExpression.compiled_regex.test(Sentences[index]) && (!matches.includes(RegularExpression.id) && process.env.NO_DUPLICATES == "1")) {
 
 
 											let quoteStart = parsed.documents[documentIndex].text.indexOf(Sentences[index]);
 											let quoteEnd = quoteStart + Sentences[index].length;
 
-											console.log(color.magenta("[DocBot]"), color.magenta(`<${ws.sessionID}>`), color.green("I have found a match on Line"), color.magenta(index), color.green("for the case"), color.magenta(RegularExpression.caseID), color.red(crypto.createHash('md5').update(Sentences[index]).digest("hex")));
+											console.log(color.magenta("[DocBot]"), color.magenta(`<${ws.sessionID}>`), color.green("I have found a match on Line"), color.magenta(index), color.green("for the case"), color.magenta(RegularExpression.id), color.red(crypto.createHash('md5').update(Sentences[index]).digest("hex")));
 
 											clearTimeout(timeout);
 											ws.send(Response.match(
@@ -289,7 +289,7 @@ publicIp.v4().then((ip) => {
 												quoteEnd,
 												ws.ContentType
 											));
-											matches.push(RegularExpression.caseID);
+											matches.push(RegularExpression.id);
 											timeout = setTimeout(() => {
 												ws.send(Response.message("finished", null, ws.ContentType));
 											}, 5000);
