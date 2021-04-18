@@ -309,6 +309,8 @@ publicIp.v4().then((ip) => {
                             let matches = [];
                             console.log(color.magenta("[DocBot]"), color.magenta(`<${ws.sessionID}>`), color.green("Starting Request to Service"), color.magenta(messageJSON.service), color.red(crypto.createHash('md5').update(messageJSON.service).digest("hex")));
 
+                            ws.send(Response.message("starting", null, ws.ContentType));
+
                             const req = https.request(options, response => {
                                 response.on('data', function (chunk) {
                                     if (parseInt(process.env.VERBOSITY) >= 3) {
