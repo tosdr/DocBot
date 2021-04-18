@@ -16,6 +16,7 @@ import * as JSON5 from 'json5';
 import * as Package from './package.json';
 import * as crypto from 'crypto';
 import * as publicIp from 'public-ip';
+import { exit } from 'process';
 function objToString(obj) {
     var str = '';
     for (var p in obj) {
@@ -259,8 +260,13 @@ publicIp.v4().then((ip) => {
                             console.log(apiresponse);
 
 
-                            if (!(apiresponse.error & 0x100) || !(apiresponse.parameters.permissions & 0x8) || apiresponse.parameters.revoked || (apiresponse.parameters.expires_at != null || Math.floor(new Date(apiresponse.parameters.expires_at).getTime()) > Math.floor(new Date().getTime()))) {
+                            if (!(apiresponse.error & 0x100) || !(apiresponse.parameters.permissions & 0x10) || apiresponse.parameters.revoked || (apiresponse.parameters.expires_at !== null || Math.floor(new Date(apiresponse.parameters.expires_at).getTime()) > Math.floor(new Date().getTime()))) {
                                 ws.send(Response.error("api_key_mismatch", 0, ws.ContentType));
+                                return;
+                            }
+
+                            if (apiresponse.parameters.expires_at !== null || Math.floor(new Date(apiresponse.parameters.expires_at).getTime()) < Math.floor(Date.now())) {
+                                ws.send(Response.error("api_key_expired", 0, ws.ContentType));
                                 return;
                             }
 
