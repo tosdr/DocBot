@@ -260,12 +260,21 @@ publicIp.v4().then((ip) => {
                             console.log(apiresponse);
 
 
-                            if (!(apiresponse.error & 0x100) || !(apiresponse.parameters.permissions & 0x10) || apiresponse.parameters.revoked || (apiresponse.parameters.expires_at !== null || Math.floor(new Date(apiresponse.parameters.expires_at).getTime()) > Math.floor(new Date().getTime()))) {
+                            if (!(apiresponse.error & 0x100) || apiresponse.parameters.revoked) {
                                 ws.send(Response.error("api_key_mismatch", 0, ws.ContentType));
                                 return;
                             }
 
-                            if (apiresponse.parameters.expires_at !== null || Math.floor(new Date(apiresponse.parameters.expires_at).getTime()) < Math.floor(Date.now())) {
+                            if (apiresponse.parameters.revoked) {
+                                ws.send(Response.error("api_key_revoked", 0, ws.ContentType));
+                                return;
+                            }
+                            if (!(apiresponse.parameters.permissions & 0x10)) {
+                                ws.send(Response.error("api_key_permission_mismatch", 0, ws.ContentType));
+                                return;
+                            }
+
+                            if (apiresponse.parameters.expires_at !== null && Math.floor(new Date(apiresponse.parameters.expires_at).getTime()) < Math.floor(Date.now())) {
                                 ws.send(Response.error("api_key_expired", 0, ws.ContentType));
                                 return;
                             }
