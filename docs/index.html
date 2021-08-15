@@ -20,7 +20,7 @@
                 <div class="input-group-prepend">
                     <span class="input-group-text">Gateway Server</span>
                 </div>
-                <input type="text" class="form-control" value="ws.docbot.tosdr.org" placeholder="Gateway Server address" id="server">
+                <input type="text" class="form-control" value="wss://ws.docbot.tosdr.org" placeholder="Gateway Server address" id="server">
                 <div class="input-group-append">
                     <button id="connect" onclick="init();" class="btn btn-success" type="submit">Connect</button>
                 </div>
@@ -117,7 +117,7 @@
         }
 
         function initWebsocket() {
-            websocket = new WebSocket("ws://" + document.getElementById("server").value);
+            websocket = new WebSocket(document.getElementById("server").value);
             websocket.onopen = function (evt) { onOpen(evt) };
             websocket.onclose = function (evt) { onClose(evt) };
             websocket.onmessage = function (evt) { onMessage(evt) };
@@ -173,6 +173,7 @@
         }
 
         function doSend(message) {
+            $("#table").empty();
             writeToScreen("SENT: " + message);
             websocket.send(message);
         }

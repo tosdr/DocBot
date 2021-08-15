@@ -228,7 +228,7 @@ publicIp.v4().then((ip) => {
                     const keyreq = https.request({
                         hostname: 'api.tosdr.org',
                         port: 443,
-                        path: '/apikey/v1/?apikey=' + messageJSON.api_key,
+                        path: '/apikey/v1/?apikey=' + messageJSON.api_key.trim(),
                         method: 'GET',
                         headers: {
                             'User-Agent': 'DocBotServer/' + Package.version + ' (+https://github.com/tosdr/DocBot-Server)',
