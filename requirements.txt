@@ -1,0 +1,16 @@
+# Requirements for research and training
+boto3
+datasets
+langdetect
+pandas
+peft
+prefect
+prefect-aws
+pytest
+scikit-learn
+seaborn
+spacy
+sqlalchemy
+transformers
+torch
+wandb

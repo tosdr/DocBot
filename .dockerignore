@@ -1,0 +1,12 @@
+data
+!data/*.pkl
+logs
+wandb
+notebooks
+__pycache__/
+tst
+.run
+.pytest_cache
+.DS_Store
+.idea/
+.vs/

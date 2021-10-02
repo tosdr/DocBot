@@ -1,0 +1,20 @@
+# syntax=docker/dockerfile:1
+FROM pytorch/pytorch:1.13.1-cuda11.6-cudnn8-runtime as build
+
+RUN conda init bash && \
+    . ~/.bashrc && \
+    yes | conda create -n tosdr python=3.9 && \
+    conda activate tosdr
+
+COPY requirements.txt /requirements.txt
+
+RUN pip install --no-cache-dir -r /requirements.txt && \
+    python -m spacy download en_core_web_md
+
+ENV PYTHONPATH=/
+WORKDIR /
+
+COPY . /.
+
+# Using ENTRYPOINT allows us to pass args with `docker run`
+ENTRYPOINT ["python", "/src/sent_spans/train.py"]

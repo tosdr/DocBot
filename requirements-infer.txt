@@ -1,0 +1,14 @@
+# Requirements for inference
+backoff
+boto3
+langdetect
+pandas
+peft
+requests
+s3fs    # Required by Prefect's ECSTask
+scikit-learn
+seaborn
+spacy
+sqlalchemy
+transformers
+torch==2.1.0

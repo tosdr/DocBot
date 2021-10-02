@@ -1,0 +1,22 @@
+# syntax=docker/dockerfile:1
+FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime as build
+
+RUN conda init bash && \
+    . ~/.bashrc && \
+    yes | conda create -n tosdr python=3.9 && \
+    conda activate tosdr
+
+COPY requirements-infer.txt /requirements-infer.txt
+
+RUN pip install --no-cache-dir -r /requirements-infer.txt && \
+    python -m spacy download en_core_web_md
+
+ENV PYTHONPATH=/
+WORKDIR /
+
+COPY . /.
+
+#RUN prefect block register -m prefect_aws.ecs
+
+# Using ENTRYPOINT allows us to pass args with `docker run`
+ENTRYPOINT ["python", "/src/apply.py"]
