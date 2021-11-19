@@ -5,6 +5,7 @@ const pkg = require('../package');
 import { Case } from '../models';
 import { Map } from '../models';
 import * as color from 'chalk';
+import * as process from 'process';
 import * as request from 'request';
 
 /**
@@ -15,8 +16,9 @@ export function loadRegex() {
     const regexs = new Map<string, Case>();
     const errored: string[] = [];
 
+
     const options = {
-        url: 'https://api.tosdr.org/all-cases/v1/nocache',
+        url: 'https://' + process.env.CRISP_API_HOST + ':' + process.env.CRISP_API_HTTPS_PORT + '/all-cases/v1/nocache',
         headers: {
             'User-Agent': 'DocBotServer/' + pkg.version + ' (+https://github.com/tosdr/DocBot-Server)'
         }

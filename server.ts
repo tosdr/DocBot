@@ -33,7 +33,7 @@ console.log(color.green(`
   / / / / __ \/ ___/ __  / __ \/ __/
  / /_/ / /_/ / /__/ /_/ / /_/ / /_  
 /_____/\____/\___/_____/\____/\__/  
-         Server ${Package.version}                        
+         Server ${Package.version}
 
 `));
 console.log(color.red(`BETA Project by Justin Back`));
@@ -226,8 +226,8 @@ publicIp.v4().then((ip) => {
 
                     let strkey = "";
                     const keyreq = https.request({
-                        hostname: 'api.tosdr.org',
-                        port: 443,
+                        hostname: process.env.CRISP_API_HOST,
+                        port: process.env.CRISP_API_HTTPS_PORT,
                         path: '/apikey/v1/?apikey=' + messageJSON.api_key.trim(),
                         method: 'GET',
                         headers: {
@@ -296,8 +296,8 @@ publicIp.v4().then((ip) => {
 
 
                             const options = {
-                                hostname: 'api.tosdr.org',
-                                port: 443,
+                                hostname: process.env.CRISP_API_HOST,
+                                port: process.env.CRISP_API_HTTPS_PORT,
                                 path: '/rest-service/v3/' + messageJSON.service,
                                 method: 'GET',
                                 headers: {

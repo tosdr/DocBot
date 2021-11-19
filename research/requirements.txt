@@ -1,0 +1,6 @@
+langdetect
+pandas
+psycopg2
+python=3.9
+seaborn
+sqlalchemy
