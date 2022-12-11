@@ -1,5 +1,21 @@
 image: node:latest
 
+variables:
+  LICENSE_FINDER_CLI_OPTS: '--recursive'
+
+
+sast:
+  stage: test
+include:
+- template: Security/SAST.gitlab-ci.yml
+- template: Security/Dependency-Scanning.gitlab-ci.yml
+- template: Security/Secret-Detection.gitlab-ci.yml  
+- template: Security/License-Scanning.gitlab-ci.yml
+
+
+stages:
+- test
+- build
 
 build:
   script:

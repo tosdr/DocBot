@@ -1,9 +1,8 @@
 # DocBot-Server
 
-[![Build Status](https://ci.git.tosdr.org/api/badges/tosdr/DocBot-Server/status.svg)](https://ci.git.tosdr.org/tosdr/DocBot-Server)
+[![Open in Gitpod](https://gitpod.io/button/open-in-gitpod.svg)](https://gitpod.jrbit.de/#https://gitlab.jrbit.de/tosdr/docbot-server)
 
 DocBot is a crawler which scans legal agreement for a specific set of keywords to match with ToS;DR Cases.
-
 
 
 ## Installation
@@ -20,3 +19,5 @@ DocBot is a crawler which scans legal agreement for a specific set of keywords t
 4. Enter a service id from edit.tosdr.org and hit "Crawl". Now every match should be listed
 
 API calls are served from [Crisp](https://github.com/tosdr/CrispCMS). You can call a local instance by modifying `.env`.
+
+
