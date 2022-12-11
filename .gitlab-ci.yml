@@ -1,0 +1,8 @@
+image: node:latest
+
+
+build:
+  script:
+    - npm install --save-dev
+    - ./node_modules/.bin/tsc
+    - ./node_modules/.bin/tsc --build --clean
