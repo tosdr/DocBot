@@ -1,0 +1,33 @@
+ports:
+  - name: Frontend
+    description: DocBot Frontend
+    port: 6004
+    onOpen: notify
+
+  - name: Gateway Server
+    description: DocBot Gateway
+    port: 6005
+    onOpen: notify 
+
+tasks:
+  - name: NPM Install
+    init: npm install --save-dev
+
+    
+
+vscode:
+  extensions:
+    - ms-azuretools.vscode-docker
+    - eamodio.gitlens
+    - TeamHub.teamhub
+    - felixfbecker.php-debug
+    - neilbrayfield.php-docblocker
+    - bmewburn.vscode-intelephense-client
+    - mtxr.sqltools
+    - mtxr.sqltools-driver-pg
+    - mblode.twig-language-2
+    - GitLab.gitlab-workflow
+    - DEVSENSE.composer-php-vscode
+    - caponetto.vscode-diff-viewer
+    - 42Crunch.vscode-openapi
+    - mjmlio.vscode-mjml
