@@ -354,11 +354,11 @@ def run_case(
 
             if not dont_post:
                 # Submit a quote using the original text (with HTML) as opposed to doc['content']
-                #TODO get service_id from documents GET, supply instead of 502 here
-                phoenix_client.add_point(
-                    case_id, DOCBOT_USER_ID, doc_id, 502, doc['url'], 'Docbot',
-                    doc['text'][best_start:best_end], best_start, best_end, MODEL_VERSION, score
-                )
+                if success:
+                    phoenix_client.add_point(
+                        case_id, DOCBOT_USER_ID, doc_id, doc['service_id'], doc['url'], 'Docbot',
+                        doc['text'][best_start:best_end], best_start, best_end, MODEL_VERSION, score
+                    )
                 phoenix_client.add_docbot_record(
                     case_id, doc_id, text_version, MODEL_VERSION, best_start, best_end, score
                 )
