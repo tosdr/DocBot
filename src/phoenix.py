@@ -12,8 +12,7 @@ logger = logging.getLogger(__name__)
 Client for Phoenix APIs necessary to run our models in production 
 """
 
-
-def _backoff_hdlr(details):
+def _backoff_handler(details):
     logger.info("Backing off {wait:0.1f} seconds after {tries} tries calling phoenix with args {args} and kwargs "
                 "{kwargs}".format(**details))
 
@@ -23,53 +22,48 @@ def _assert_int(n):
     return n
 
 class Client:
-    """
-    Assumes ENV variables have been set with the necessary appwrite URLs
-    """
     def __init__(self):
-        endpoints = dict()
-        for endpoint_key in ['get_doc', 'get_points', 'post_point', 'get_docbotrecords', 'post_docbotrecord']:
-            env_name = f'PHOENIX_{endpoint_key.upper()}'
-            try:
-                endpoints[endpoint_key] = os.environ[env_name]
-            except KeyError:
-                raise EnvironmentError(f"Environment variable {env_name} not set to {endpoint_key} URL")
         try:
+            # e.g. https://api.staging.tosdr.org
+            self.endpoint = os.environ['PHOENIX_API_URL']
             self.api_key = os.environ['PHOENIX_API_KEY']
         except KeyError:
-            raise EnvironmentError(f"Environment variable PHOENIX_API_KEY not set")
+            raise EnvironmentError(f"Environment variables PHOENIX_API_URL and PHOENIX_API_KEY not set")
 
-        self.endpoints = endpoints
 
-    @backoff.on_exception(backoff.expo, RuntimeError, max_time=600, on_backoff=_backoff_hdlr)
-    def _post(
-            self, endpoint: str, desc: str, allow_404: bool=False, params: dict=None, payload: dict=None,
+    @backoff.on_exception(backoff.expo, RuntimeError, max_time=300, on_backoff=_backoff_handler)
+    def _call(
+            self, path: str, method: str, is_private: bool, desc: str, allow_404: bool=False, params: dict=None,
+            payload: dict=None
     ):
         if payload is None:
             payload = dict()
+            headers = dict()
+        else:
+            headers = {'Content-Type': 'application/json'}
         if params is None:
             params = dict()
-        res = requests.post(
-            f'http://{endpoint}',
-            params=params,
-            json=payload,
-            headers={'X-Appwrite-Key': self.api_key}
-        )
+        if is_private:
+            headers['apikey'] = self.api_key
+
+        # print(f"{method} {self.endpoint}{path} {params} {payload} {headers}")
+        res = requests.request(method, f'{self.endpoint}{path}', params=params, json=payload, headers=headers)
         if res.status_code < 400 or (allow_404 and res.status_code == 404):
             return res
         else:
-            err_str = f"Phoenix client error: unable to {desc}:\n{res.status_code}"
+            err_str = f"Phoenix client error: unable to {desc}:\t{res.status_code}\n\t{self.endpoint}{path}"
             if res.text is not None and res.text.strip() != '':
-                err_str += f":\n{res.text}"
+                err_str += f"\n\t{res.text}"
             raise RuntimeError(err_str)
 
     def get_docs(self) -> list[tuple[int, str]]:
-        res = self._post(self.endpoints['get_doc'], "get all Doc IDs")
+        res = self._call('/document/v1', 'get', False, "get all Doc IDs")
         return json.loads(res.text)['parameters']['documents']
 
     def get_doc(self, doc_id) -> dict:
-        res = self._post(
-            self.endpoints['get_doc'], 'GET doc by ID', allow_404=True, params={'id': _assert_int(doc_id)}
+        res = self._call(
+            '/document/v1', 'get', False, 'GET doc by ID', allow_404=True,
+            params={'id': _assert_int(doc_id)}
         )
         if res.status_code == 200:
             return json.loads(res.text)['parameters']
@@ -85,8 +79,10 @@ class Client:
         max_pages = 1
         while current_page <= max_pages:
             # https://github.com/tosdr/API/blob/docbot/models/src/models/Points.ts#L47
-            res = self._post(
-                self.endpoints['get_points'],
+            res = self._call(
+                '/point/v1',
+                'get',
+                False,
                 'GET Points for case',
                 # Technically 404 isn't an abnormal state if this was run against a fresh staging env,
                 # but it's unexpected and safer to throw an error
@@ -117,13 +113,15 @@ class Client:
             'docbot_version': docbot_version,
             'ml_score': ml_score
         }
-        res = self._post(self.endpoints['post_point'], desc='POST new Point', payload=data_dict)
-        if res.status_code != 201:
-            raise RuntimeError("Not a 201 when POSTing point?")
+        res = self._call('/point/v1', 'post', True, 'POST new Point', payload=data_dict)
+        if res.status_code != 200:
+            raise RuntimeError(f"Not a 200 when POSTing point, got {res.status_code}")
 
     def get_docbot_records(self, case_id, docbot_version) -> set[tuple]:
-        res = self._post(
-            self.endpoints['get_docbotrecords'],
+        res = self._call(
+            '/docbotrecord/v1',
+            'get',
+            True,
             'GET DocbotRecords',
             allow_404=True,
             params={'case_id': _assert_int(case_id), 'docbot_version': docbot_version}
@@ -139,8 +137,10 @@ class Client:
             self, case_id, doc_id, text_version, docbot_version,
             char_start=None, char_end=None, ml_score=None
     ):
-        res = self._post(
-            self.endpoints['post_docbotrecord'],
+        res = self._call(
+            '/docbotrecord/v1',
+            'post',
+            True,
             desc="POST DocbotRecord",
             params={
                 'case_id': case_id,
@@ -152,5 +152,5 @@ class Client:
                 'ml_score': ml_score
             }
         )
-        if res.status_code != 201:
-            raise RuntimeError("Not a 201 when POSTing DocbotRecord?")
+        if res.status_code != 200:
+            raise RuntimeError(f"Not a 200 when POSTing DocbotRecord, returned {res.status_code}")

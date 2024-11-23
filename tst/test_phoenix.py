@@ -1,8 +1,8 @@
 from src import phoenix
 
-DOC_ID = 991
-SERVICE_ID = 1377
-CASE_ID = 163
+DOC_ID = 1378
+SERVICE_ID = 502
+CASE_ID = 235
 DOCBOT_USER_ID = 21032
 
 def test_get_docs():
@@ -14,7 +14,7 @@ def test_get_doc():
     client = phoenix.Client()
     doc = client.get_doc(DOC_ID)
     assert doc['id'] == DOC_ID
-    assert len(doc['text']) > 10000
+    assert len(doc['text']) > 200
 
 def test_get_points_for_case():
     client = phoenix.Client()

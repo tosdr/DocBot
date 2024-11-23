@@ -331,6 +331,8 @@ def run_case(
                 continue
 
             # Mark declined points as offlimits, so those character spans don't get suggested again
+            #TODO if the document changes, the declined point spans will be incorrect. Really, we should add
+            # text_version to the Point schema and only invalidate if they are current.
             declined_points = doc_points[doc_points.status == 'declined']
             off_limits = [
                 (point.quoteStart, point.quoteEnd) for i, point in declined_points.iterrows()
@@ -344,7 +346,7 @@ def run_case(
             # TODO we shouldn’t suggest case 216 if it conflicts with case 220; maybe other high-level rules
             # or should we handle this downstream, either in curator guide (/suggestion in UI) or in grading?
             # If we want to handle it here, things might get tricky since we're decoupling reaching this point
-            # vs POSTing results
+            # vs POSTing results (we could always resolve these overlaps later before posting)
 
             success = score >= threshold
             if success:
@@ -425,8 +427,8 @@ def run_all_cases(limit: int, local_models: bool, local_data: bool, dont_post: b
     doc_list = get_all_docs(local_data, phoenix_client)
     logger.info(f"Found {len(doc_list)} docs")
     if limit:
-        # case_ids = [134, 183]
-        case_ids = case_ids[:25]
+        case_ids = [117, 134]
+        # case_ids = case_ids[:25]
         doc_list = doc_list[:limit]
         logger.info(f"Limiting to {len(doc_list)} docs, cases {case_ids}")
 

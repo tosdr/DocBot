@@ -43,8 +43,6 @@ def apply_sent_span_model(
         for idx in range(0, l, n):
             yield iterable[idx: min(idx + n, l)]
 
-    # TODO revisit whether we should take the highest activation, or the highest softmax
-
     softmax_probs = []
     for batch in _batch(sent_texts):
         tokens = tokenizer(batch, return_tensors='pt', padding=True, truncation=True)
