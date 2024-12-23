@@ -2,6 +2,7 @@ import logging
 from pathlib import Path
 
 import numpy as np
+import torch
 import torch.nn.functional as f
 from tqdm import tqdm
 
@@ -12,6 +13,12 @@ logger = logging.getLogger(__name__)
 here = Path(__file__).parent
 
 MAX_EXPANSION_SENTENCES = 5
+
+def test_gpu_memory(batch_size, model, device, model_max_length):
+    # Ensure we have enough GPU memory for the largest possible batch size
+    tokens = torch.zeros(size=(batch_size, model_max_length), dtype=torch.int64, device=device)
+    model(tokens)
+    return
 
 def apply_sent_span_model(
         text, sent_boundaries: list[int], tokenizer, hf_model, batch_size, device, off_limits=None

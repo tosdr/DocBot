@@ -218,7 +218,8 @@ class DocStore:
             doc['content'] = content
             doc['lang'] = detect_lang(content)
 
-            spacy_doc = self.spacy_model(content)
+            # Spacy has a default limit of 1mil characters. This can be increased, but probably safest to have a ceiling
+            spacy_doc = self.spacy_model(content[:1000000])
             sents = list(filter(lambda sent: sent.text != '' and not sent.text.isspace(), spacy_doc.sents))
             sent_boundaries = list(sorted(map(lambda s: s.start_char, sents)))
             doc['sent_boundaries'] = sent_boundaries
@@ -276,11 +277,16 @@ def run_case(
         # Turn list of dicts into a dataframe, to match the access pattern when local_data is True
         points = pd.DataFrame(points_list)
     logger.info(f"Found {len(points)} points")
+    # Points document_id is a float, we'll want to turn it into a str for comparison (ideally this should be done earlier)
+    points['document_id'] = points.document_id.apply(lambda doc_id: None if pd.isna(doc_id) else str(int(doc_id)))
 
     base_model = AutoModelForSequenceClassification.from_pretrained(BASE_MODEL_NAME)
     model = load_peft_model(case_id, base_model, local_models)
     model = model.to(device)
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
+
+    # In theory this should let us test how big we can make our batches, though I've noticed it can still run OOM
+    inference.test_gpu_memory(batch_size, model, device, tokenizer.model_max_length)
 
     if local_data:
         visited_docs = set()
@@ -335,8 +341,8 @@ def run_case(
             # text_version to the Point schema and only invalidate if they are current.
             declined_points = doc_points[doc_points.status == 'declined']
             off_limits = [
-                (point.quoteStart, point.quoteEnd) for i, point in declined_points.iterrows()
-                if not pd.isna(point.quoteStart) and not pd.isna(point.quoteEnd)
+                (point.quote_start, point.quote_end) for i, point in declined_points.iterrows()
+                if not pd.isna(point.quote_start) and not pd.isna(point.quote_end)
             ]
 
             score, best_start, best_end, _ = inference.apply_sent_span_model(
@@ -357,8 +363,9 @@ def run_case(
             if not dont_post:
                 # Submit a quote using the original text (with HTML) as opposed to doc['content']
                 if success:
+                    analysis = f'Created by Docbot version {MODEL_VERSION}'
                     phoenix_client.add_point(
-                        case_id, DOCBOT_USER_ID, doc_id, doc['service_id'], doc['url'], 'Docbot',
+                        case_id, DOCBOT_USER_ID, doc_id, doc['service_id'], doc['url'], analysis,
                         doc['text'][best_start:best_end], best_start, best_end, MODEL_VERSION, score
                     )
                 phoenix_client.add_docbot_record(
@@ -402,7 +409,6 @@ def save_results(case_result_scores, case_result_counts, results_dir, s3_client,
                 buffer, MODEL_S3_BUCKET, s3_key,
                 ExtraArgs={'ContentType': 'application/x-binary'}
             )
-
 
 def run_all_cases(limit: int, local_models: bool, local_data: bool, dont_post: bool, batch_size: int, device: str):
     start_s = time.time()
