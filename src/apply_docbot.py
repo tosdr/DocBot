@@ -12,16 +12,14 @@ import tempfile
 import time
 
 import boto3
-import langdetect
-from langdetect import DetectorFactory
-from langdetect.lang_detect_exception import LangDetectException
 import pandas as pd
 from peft import PeftModel
 import spacy
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-from src import inference, phoenix, utils
+from src import inference, phoenix, utils, apply_local
+from src.inference import MODEL_VERSION
 
 """
 Script run weekly within ToS;DR to apply our case models to any recently crawled privacy/terms documents.
@@ -31,162 +29,17 @@ Uses Phoenix API enpoints (phoenix.py) to retrieve docs and points, and to POST 
 here = Path(__file__).parent
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-DetectorFactory.seed = 0
 
 MODEL_S3_BUCKET = 'tosdr-training'
 AWS_REGION = 'us-east-1'
 
-# This has to match the upload key specified when training. It will also be used to record whether docbot has covered
-# docs, so if we train a new model and want to rerun, this should be updated.
-MODEL_VERSION = 'v3'
 DOCBOT_USER_ID = 21032
 
-# Case-specific positive prediction thresholds. These come from pr_curves.ipynb, and optimize fscore with beta=1.5
-THRESHOLDS = {
-    117: 0.9313029646873474,
-    118: 0.9996505975723267,
-    121: 0.9194583892822266,
-    122: 0.9512377381324768,
-    124: 0.999946117401123,
-    126: 0.8929231762886047,
-    127: 0.31597447395324707,
-    128: 0.8838386535644531,
-    129: 0.9749407768249512,
-    130: 0.9065191149711609,
-    134: 0.7489349842071533,
-    138: 0.8780727386474609,
-    139: 0.9998829364776611,
-    140: 0.9612037539482117,
-    143: 0.9117705225944519,
-    145: 0.9865456819534302,
-    146: 0.06113763153553009,
-    147: 0.9860677123069763,
-    148: 0.9632765650749207,
-    149: 0.9952959418296814,
-    150: 0.9619890451431274,
-    151: 0.9394944906234741,
-    152: 0.5705567002296448,
-    162: 0.9346338510513306,
-    163: 0.31521105766296387,
-    164: 0.404929518699646,
-    166: 0.4554845690727234,
-    170: 0.690903902053833,
-    175: 0.9982500672340393,
-    177: 0.979971706867218,
-    178: 0.939058244228363,
-    182: 0.9997735619544983,
-    183: 0.9350226521492004,
-    187: 0.7722886800765991,
-    188: 0.2906496822834015,
-    190: 0.4945354163646698,
-    193: 0.9803260564804077,
-    195: 0.9073813557624817,
-    196: 0.9988189339637756,
-    197: 0.9934123158454895,
-    199: 0.5093461871147156,
-    201: 0.21304339170455933,
-    202: 0.2907284200191498,
-    203: 0.9348453879356384,
-    205: 0.5213550925254822,
-    207: 0.6749431490898132,
-    208: 0.9928780198097229,
-    210: 0.9505872130393982,
-    211: 0.9587513208389282,
-    214: 0.9999645948410034,
-    215: 0.9992538094520569,
-    216: 0.43725141882896423,
-    217: 0.9967785477638245,
-    218: 0.970154881477356,
-    219: 0.18621566891670227,
-    220: 0.9325112104415894,
-    223: 0.9068081378936768,
-    226: 0.7020467519760132,
-    227: 0.7985442280769348,
-    228: 0.05485598370432854,
-    229: 0.9920095205307007,
-    230: 0.9913994073867798,
-    231: 0.999704897403717,
-    232: 0.9997180104255676,
-    233: 0.5125555992126465,
-    239: 0.8622395396232605,
-    241: 0.534091591835022,
-    242: 0.955049455165863,
-    243: 0.9986709356307983,
-    278: 0.9924724102020264,
-    279: 0.9935654997825623,
-    280: 0.34931480884552,
-    281: 0.867756187915802,
-    283: 0.9267996549606323,
-    284: 0.9948242902755737,
-    285: 0.9964261651039124,
-    286: 0.5064982175827026,
-    287: 0.2425031214952469,
-    288: 0.34972575306892395,
-    289: 0.7902135848999023,
-    290: 0.5488492250442505,
-    291: 0.9992871880531311,
-    292: 0.9986388087272644,
-    293: 0.7992552518844604,
-    294: 0.9807372093200684,
-    295: 0.24001362919807434,
-    297: 0.9939224123954773,
-    298: 0.9999438524246216,
-    299: 0.9987969398498535,
-    300: 0.6722489595413208,
-    303: 0.8706561326980591,
-    306: 0.8188225626945496,
-    307: 0.9365635514259338,
-    310: 0.9998196959495544,
-    311: 0.6947453022003174,
-    313: 0.9986419081687927,
-    314: 0.995353102684021,
-    315: 0.5673277378082275,
-    323: 0.29618099331855774,
-    325: 0.9868621826171875,
-    326: 0.7446432113647461,
-    329: 0.7189320921897888,
-    331: 0.7955061197280884,
-    333: 0.9513622522354126,
-    336: 0.6547670960426331,
-    339: 0.3487551510334015,
-    373: 0.8815233707427979,
-    374: 0.9988458156585693,
-    375: 0.9324948191642761,
-    376: 0.45920634269714355,
-    377: 0.9996823072433472,
-    382: 0.6362333297729492,
-    383: 0.9639233946800232,
-    384: 0.48562130331993103,
-    387: 0.9989765882492065,
-    399: 0.7867100834846497,
-    400: 0.8498532176017761,
-    402: 0.3530770242214203,
-    403: 0.9664086699485779,
-    481: 0.8873093724250793,
-    482: 0.996204674243927,
-    484: 0.9723506569862366,
-    486: 0.9942421317100525
-}
-
-# For testing, otherwise these are kept in S3
-LOCAL_PEFT_PATH = here / f'../data/models/{MODEL_VERSION}/'
-LOCAL_DUMP_VERSION = '211222'
-
-# If --local_models will use this for huggingface's from_pretrained()
-# Else, will look in our s3 bucket
-BASE_MODEL_NAME = 'bert-base-uncased'
 
 LOG_DIR = here / '../logs'
 def get_results_dir(timestamp):
     return here / f'../data/results/{timestamp}'
 
-
-def detect_lang(text: str):
-    try:
-        return langdetect.detect(text)
-    except LangDetectException as e:
-        logger.error(f"Problem detecting lang: {e}")
-        return None
 
 class DocStore:
     def __init__(self, local_data: bool, phoenix_client):
@@ -196,14 +49,22 @@ class DocStore:
 
         self.local_data = local_data
         self.phoenix_client = phoenix_client
-        self.local_docs = pd.read_pickle(here / f'../data/documents_{LOCAL_DUMP_VERSION}.pkl')
+        self.local_docs = pd.read_pickle(here / f'../data/documents_{apply_local.LOCAL_DUMP_VERSION}.pkl')
 
-        # Since we plan to use one machine we can just cache docs here. It we scale up to a big cluster we can use Redis
-        self.docs = dict()
+        # Since we plan to use one machine we can just cache docs here. It we scale up to a big cluster we can have them
+        # share a cache.
+        # Update: since fetching/prepping docs is the slowest step, and we're seeing intermittent crashes from API DNS
+        # failures, I'm adding a cache on disk so this is preserved across restarts.
+        self.cache_loc = here / '../data/doc_cache.pkl'
+        try:
+            self.docs = pickle.load(open(self.cache_loc, 'rb'))
+        except FileNotFoundError:
+            self.docs = dict()
 
     def __getitem__(self, doc_id):
         if doc_id not in self.docs:
             self.docs[doc_id] = self.fetch_doc(doc_id)
+            pickle.dump(self.docs, open(self.cache_loc, 'wb'))
         return self.docs[doc_id]
 
     def fetch_doc(self, doc_id):
@@ -216,13 +77,14 @@ class DocStore:
         if doc is not None and doc['text'] is not None:
             content = utils.preprocess_doc_text(doc['text'])
             doc['content'] = content
-            doc['lang'] = detect_lang(content)
+            doc['lang'] = inference.detect_lang(content)
 
-            # Spacy has a default limit of 1mil characters. This can be increased, but probably safest to have a ceiling
-            spacy_doc = self.spacy_model(content[:1000000])
-            sents = list(filter(lambda sent: sent.text != '' and not sent.text.isspace(), spacy_doc.sents))
-            sent_boundaries = list(sorted(map(lambda s: s.start_char, sents)))
-            doc['sent_boundaries'] = sent_boundaries
+            if doc['lang'] == 'en':
+                # Spacy has a default limit of 1mil characters. This can be increased, but probably safest to have a ceiling
+                spacy_doc = self.spacy_model(content[:1000000])
+                sents = list(filter(lambda sent: sent.text != '' and not sent.text.isspace(), spacy_doc.sents))
+                sent_boundaries = list(sorted(map(lambda s: s.start_char, sents)))
+                doc['sent_boundaries'] = sent_boundaries
 
         return doc
 
@@ -247,7 +109,7 @@ def get_aws_creds() -> dict[str, str]:
 
 def load_peft_model(case_id, base_model, local_models):
     if local_models:
-        peft_model_loc = (LOCAL_PEFT_PATH / str(case_id)).as_posix()
+        peft_model_loc = apply_local.peft_path(case_id)
         logger.info(f"Initializing PEFT adapter from {peft_model_loc}")
     else:
         # Each case could take a long time, so get new IAM Role credentials to be safe (12 hour limit)
@@ -270,7 +132,7 @@ def run_case(
         doc_list: list[tuple[int, str]], doc_store, phoenix_client, threshold, batch_size, device
 ):
     if local_data:
-        local_points = pd.read_pickle(here / f'../data/points_{LOCAL_DUMP_VERSION}.pkl')
+        local_points = pd.read_pickle(here / f'../data/points_{apply_local.LOCAL_DUMP_VERSION}.pkl')
         points = local_points[local_points.case_id == case_id]
     else:
         points_list = phoenix_client.get_points_for_case(case_id)
@@ -280,10 +142,10 @@ def run_case(
     # Points document_id is a float, we'll want to turn it into a str for comparison (ideally this should be done earlier)
     points['document_id'] = points.document_id.apply(lambda doc_id: None if pd.isna(doc_id) else str(int(doc_id)))
 
-    base_model = AutoModelForSequenceClassification.from_pretrained(BASE_MODEL_NAME)
+    base_model = AutoModelForSequenceClassification.from_pretrained(inference.BASE_MODEL_NAME)
     model = load_peft_model(case_id, base_model, local_models)
     model = model.to(device)
-    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(inference.BASE_MODEL_NAME)
 
     # In theory this should let us test how big we can make our batches, though I've noticed it can still run OOM
     inference.test_gpu_memory(batch_size, model, device, tokenizer.model_max_length)
@@ -378,7 +240,7 @@ def run_case(
 
 def get_all_docs(local_data, phoenix_client) -> list[tuple[str, str]]:
     if local_data:
-        ids = pd.read_pickle(here / f'../data/documents_{LOCAL_DUMP_VERSION}.pkl').id.values
+        ids = pd.read_pickle(here / f'../data/documents_{apply_local.LOCAL_DUMP_VERSION}.pkl').id.values
         # There was no text_version in the older documents schema, so just pretend they're all '0'
         return [(i, '0') for i in ids]
     else:
@@ -455,7 +317,7 @@ def run_all_cases(limit: int, local_models: bool, local_data: bool, dont_post: b
 
         result_counts, result_scores = run_case(
             case_id, local_models, local_data, dont_post,
-            doc_list, doc_store, phoenix_client, THRESHOLDS[case_id], batch_size, device
+            doc_list, doc_store, phoenix_client, inference.THRESHOLDS[case_id], batch_size, device
         )
         for result, count in result_counts.items():
             total_result_counts[result] += count
@@ -468,6 +330,9 @@ def run_all_cases(limit: int, local_models: bool, local_data: bool, dont_post: b
             logger.info(f"Prediction scores:\n{pd.Series(list(result_scores.values())).describe()}")
 
         # Serialize latest results in case of crash
+        # Get new S3 credentials in case the 12 hour limit ran out
+        if not dont_post or not local_models:
+            s3_client = boto3.client('s3', **get_aws_creds(), region_name=AWS_REGION)
         save_results(case_result_scores, case_result_counts, results_dir, None if dont_post else s3_client, timestamp_key)
 
     end_s = time.time()

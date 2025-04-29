@@ -1,7 +1,10 @@
 import backoff
+import errno
+import functools
 import json
 import logging
 import os
+import signal
 
 import requests
 
@@ -21,6 +24,42 @@ def _assert_int(n):
         raise ValueError(f"{n} is not an int?")
     return n
 
+"""
+At one point requests.request() hung indefinitely with:
+  File "/opt/conda/lib/python3.11/ssl.py", line 517, in wrap_socket
+    return self.sslsocket_class._create(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/conda/lib/python3.11/ssl.py", line 1104, in _create
+    self.do_handshake()
+  File "/opt/conda/lib/python3.11/ssl.py", line 1382, in do_handshake
+    self._sslobj.do_handshake()
+
+Apparently this is rare but the only way around it is to timeout the function:
+https://bugs.python.org/issue34438
+https://stackoverflow.com/questions/19938593/web-app-hangs-for-several-hours-in-ssl-py-at-self-sslobj-do-handshake
+https://stackoverflow.com/questions/2281850/timeout-function-if-it-takes-too-long-to-finish
+"""
+# note this is not thread safe
+def timeout(seconds=60, error_message=os.strerror(errno.ETIME)):
+    def decorator(func):
+        def _handle_timeout(signum, frame):
+            raise RuntimeError(error_message)
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            signal.signal(signal.SIGALRM, _handle_timeout)
+            signal.alarm(seconds)
+            try:
+                result = func(*args, **kwargs)
+            finally:
+                signal.alarm(0)
+            return result
+
+        return wrapper
+
+    return decorator
+
+
 class Client:
     def __init__(self):
         try:
@@ -30,8 +69,12 @@ class Client:
         except KeyError:
             raise EnvironmentError(f"Environment variables PHOENIX_API_URL and PHOENIX_API_KEY not set")
 
+    @timeout()
+    def _request(self, request_kwargs: dict):
+        # print(f"{**request_kwargs}")
+        return requests.request(**request_kwargs)
 
-    @backoff.on_exception(backoff.expo, RuntimeError, max_time=300, on_backoff=_backoff_handler)
+    @backoff.on_exception(backoff.expo, RuntimeError, max_time=900, on_backoff=_backoff_handler)
     def _call(
             self, path: str, method: str, is_private: bool, desc: str, allow_404: bool=False, params: dict=None,
             payload: dict=None
@@ -46,8 +89,9 @@ class Client:
         if is_private:
             headers['apikey'] = self.api_key
 
-        # print(f"{method} {self.endpoint}{path} {params} {payload} {headers}")
-        res = requests.request(method, f'{self.endpoint}{path}', params=params, json=payload, headers=headers)
+        res = self._request(
+            dict(method=method, url=f'{self.endpoint}{path}', params=params, json=payload, headers=headers)
+        )
         if res.status_code < 400 or (allow_404 and res.status_code == 404):
             return res
         else:
@@ -57,16 +101,16 @@ class Client:
             raise RuntimeError(err_str)
 
     def get_docs(self) -> list[tuple[int, str]]:
-        res = self._call('/document/v1', 'get', False, "get all Doc IDs")
-        return json.loads(res.text)['parameters']['documents']
+        res = self._call('/document/v2', 'get', False, "get all Doc IDs")
+        return json.loads(res.text)['documents']
 
     def get_doc(self, doc_id) -> dict:
         res = self._call(
-            '/document/v1', 'get', False, 'GET doc by ID', allow_404=True,
+            '/document/v2', 'get', False, 'GET doc by ID', allow_404=True,
             params={'id': _assert_int(doc_id)}
         )
         if res.status_code == 200:
-            return json.loads(res.text)['parameters']
+            return json.loads(res.text)
         elif res.status_code == 404:
             logger.warning(f"Doc {doc_id} not found in Phoenix")
             return None
@@ -90,9 +134,9 @@ class Client:
                 params={'case_id': _assert_int(case_id), 'page': current_page}
             )
 
-            res_parameters = json.loads(res.text)['parameters']
+            res_parameters = json.loads(res.text)
             points += res_parameters['points']
-            max_pages = res_parameters['_page']['end']
+            max_pages = res_parameters['page']['end']
             current_page += 1
         return points
 
@@ -126,10 +170,10 @@ class Client:
             allow_404=True,
             params={'case_id': _assert_int(case_id), 'docbot_version': docbot_version}
         )
-        if res.status_code == 200:
-            return set(map(tuple, json.loads(res.text)['parameters']['documents']))
-        elif res.status_code == 404:
+        if res.status_code == 404 or len(json.loads(res.text)) == 0:
             return set()
+        elif res.status_code == 200:
+            return set(map(tuple, json.loads(res.text)['documents']))
         else:
             raise RuntimeError(f"Unexpected response code {res.status_code} from GET DocbotRecords?")
 
