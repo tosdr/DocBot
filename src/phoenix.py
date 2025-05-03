@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import signal
+import time
 
 import requests
 
@@ -138,6 +139,8 @@ class Client:
             points += res_parameters['points']
             max_pages = res_parameters['page']['end']
             current_page += 1
+            if current_page < max_pages:
+                time.sleep(0.5)
         return points
 
     def add_point(
@@ -158,8 +161,8 @@ class Client:
             'ml_score': ml_score
         }
         res = self._call('/point/v1', 'post', True, 'POST new Point', payload=data_dict)
-        if res.status_code != 200:
-            raise RuntimeError(f"Not a 200 when POSTing point, got {res.status_code}")
+        if res.status_code != 201:
+            raise RuntimeError(f"Not a 201 when POSTing point, got {res.status_code}")
 
     def get_docbot_records(self, case_id, docbot_version) -> set[tuple]:
         res = self._call(
@@ -196,5 +199,5 @@ class Client:
                 'ml_score': ml_score
             }
         )
-        if res.status_code != 200:
-            raise RuntimeError(f"Not a 200 when POSTing DocbotRecord, returned {res.status_code}")
+        if res.status_code != 201:
+            raise RuntimeError(f"Not a 201 when POSTing DocbotRecord, returned {res.status_code}")
