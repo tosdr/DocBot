@@ -17,4 +17,4 @@ WORKDIR /
 COPY . /.
 
 # Using ENTRYPOINT allows us to pass args with `docker run`
-ENTRYPOINT ["python", "/src/apply.py"]
+ENTRYPOINT ["python", "/src/apply_docbot.py"]

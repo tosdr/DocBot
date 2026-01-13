@@ -275,6 +275,8 @@ def make_sent_span_datasets(cases, documents, points, topics, services, en_only=
         instance_df = approved.copy()
 
         # Add declined points
+        #TODO don't add declined pionts if there was also an approved one in the same doc; it may have been declined for
+        # being a duplicate
         declined = points[(points.case_id == target_case.id) & (points.status == 'declined')]
         declined = declined.assign(label='negative', source='declined')
         instance_df = pd.concat([instance_df, declined])

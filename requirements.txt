@@ -11,6 +11,7 @@ scikit-learn
 seaborn
 spacy
 sqlalchemy
+textacy
 transformers
 torch
 wandb

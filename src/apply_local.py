@@ -10,7 +10,7 @@ from src import inference, utils
 from src.inference import MODEL_VERSION
 
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 here = Path(__file__).parent
 
@@ -76,7 +76,7 @@ def run_ad_hoc(text_file_paths: list, device='mps', batch_size=16):
         tokenizer = AutoTokenizer.from_pretrained(inference.BASE_MODEL_NAME)
 
         for filename, boundaries, text in zip(filenames, sent_boundaries, texts):
-            score, best_start, best_end, _ = inference.apply_sent_span_model(
+            score, best_start, best_end, _, __ = inference.apply_sent_span_model(
                 text, boundaries, tokenizer, model, batch_size, device, off_limits=None
             )
             evidence_str = text[best_start:best_end]

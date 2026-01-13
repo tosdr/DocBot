@@ -10,7 +10,6 @@ from openpyxl.styles import Font, Alignment
 import pandas as pd
 from tqdm import tqdm
 
-from src import make_classification_datasets
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

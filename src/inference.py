@@ -1,10 +1,13 @@
 import logging
 from pathlib import Path
+import pickle
 
 import langdetect
 from langdetect import DetectorFactory
 from langdetect.lang_detect_exception import LangDetectException
 import numpy as np
+import spacy
+from textacy import extract
 import torch
 import torch.nn.functional as f
 from tqdm import tqdm
@@ -165,24 +168,77 @@ def test_gpu_memory(batch_size, model, device, model_max_length):
     model(tokens)
     return
 
+def load_prefilter_kwargs(case_id):
+    from tfidf import model_output_dir
+    prefilter_dir = model_output_dir(case_id)
+    return {
+        'vectorizer': pickle.load(open(prefilter_dir / 'vectorizer.pkl', 'rb')),
+        'model': pickle.load(open(prefilter_dir / 'model.pkl', 'rb')),
+        'threshold': pickle.load(open(prefilter_dir / 'final_metrics.pkl', 'rb'))['threshold'],
+        # Disable all components except tokenizer for faster ngram extraction
+        'spacy_model': spacy.load(
+            'en_core_web_md', disable=['tok2vec', 'tagger', 'parser', 'attribute_ruler', 'lemmatizer', 'ner']
+        )
+    }
+
+def apply_prefilter(
+        text: str, sent_boundaries: list[int], vectorizer, model, threshold, spacy_model
+) -> tuple[list[tuple[int, int]], float]:
+    """
+    Applies a high-recall TF-IDF classification model as a prefilter. Must let at least one sentence through the filter,
+    because the caller's job is to find the most likely sentence.
+    :return: a list of off-limits spans of the text (character start/end position), and a float filter rate so we can
+        track how much inference we're saving.
+    """
+    terms: list[list[str]] = []
+    for sent_idx in range(len(sent_boundaries) - 1):
+        sent_text = text[sent_boundaries[sent_idx]:sent_boundaries[sent_idx + 1]]
+        terms.append([span.text.lower() for span in extract.ngrams(spacy_model(sent_text), n=[1, 2])])
+
+    # Sparse matrix of term counts
+    sentence_vectors = vectorizer.fit_transform(terms)
+    pred_proba = model.predict_proba(sentence_vectors)[:, 1]
+    max_prob_idx = pred_proba.argmax()
+
+    offlimits = []
+    for sent_idx in range(len(sent_boundaries) - 1):
+        if sent_idx != max_prob_idx and pred_proba[sent_idx] < threshold:
+            offlimits.append((sent_boundaries[sent_idx], sent_boundaries[sent_idx + 1]))
+
+    return offlimits, len(offlimits) / len(sent_boundaries)
+
+
 def apply_sent_span_model(
-        text, sent_boundaries: list[int], tokenizer, hf_model, batch_size, device, off_limits=None
-) -> tuple[float, int, int, int]:
+        text: str, sent_boundaries: list[int],
+        prefilter_kwargs,
+        tokenizer, hf_model, batch_size, device,
+        off_limits: list[tuple[int, int]]=None
+) -> tuple[float, int, int, int, float]:
     """
     Takes a model that was trained for text classification on sentence spans (usually 1 or 2, but potentially 5+)
     and applies it to full documents.
-    First applies the model to every sentence, finding the maximum score. Then tries expanding the bounaries on
-    either side, looking for an even higher score.
+    First applies a two-phase model to every sentence, finding the maximum score: phase 1 is a fast TF-IDF model that
+    narrows it down to relevant sentences, phase 2 is a fine-tuned BERT classifier.
+
+    Then tries expanding the boundaries on either side, looking for an even higher score.
     Ideally we'll end up with the minimal representative sentence span that contains evidence for the case, and we don't
     know in advance how long that will be.
 
     Char spans can be marked as off limits with list[tuple(int, int)] off_limits. This is so that in production we can
     avoid re-suggesting a point that was declined by a curator.
+
+    Returns the winning score, the winning char span, how many sentences it spans, and the prefilter filter rate
     """
     if off_limits is None:
         off_limits = []
     sent_boundaries = sent_boundaries + [None]
-    sent_texts = [text[sent_boundaries[i]: sent_boundaries[i+1]] for i in range(len(sent_boundaries) - 1)]
+
+    # Most of the sentences we can quickly disqualify by testing for key terms, via a TF-IDF classifier prefilter
+    #TODO precompute / use doc cache for prefilter tokenization so they are shared between cases?
+    filtered_sents, filter_rate = apply_prefilter(text, sent_boundaries, **prefilter_kwargs)
+    off_limits += filtered_sents
+    logger.debug(f"TF-IDF prefilter applied with filter rate {filter_rate:.2f}")
+
     def _is_overlapping(start, end):
         return any([((off_end is None or off_end > start) and (end is None or off_start < end))
                     for off_start, off_end in off_limits])
@@ -195,16 +251,17 @@ def apply_sent_span_model(
         for idx in range(0, l, n):
             yield iterable[idx: min(idx + n, l)]
 
+    valid_sent_indices = np.where(~np.array(sent_off_limits))[0]
+    sent_texts = [text[sent_boundaries[i]: sent_boundaries[i + 1]] for i in valid_sent_indices]
     softmax_probs = []
     for batch in _batch(sent_texts):
         tokens = tokenizer(batch, return_tensors='pt', padding=True, truncation=True)
         tokens.to(device)
-        preds = hf_model(**tokens.data)
+        preds = hf_model(**tokens)
         softmax_probs += f.softmax(preds.logits, dim=1)[:,1].tolist()
     softmax_probs = np.array(softmax_probs)
-    softmax_probs[sent_off_limits] = -np.inf
     best_score = softmax_probs.max()
-    best_sent_idx = softmax_probs.argmax()
+    best_sent_idx = valid_sent_indices[softmax_probs.argmax()]
 
     # We'll now try extending the best scoring span up to 5 sentences to the left and right, looking for a higher score.
 
@@ -224,7 +281,7 @@ def apply_sent_span_model(
         for batch in _batch(texts_with_priors):
             tokens = tokenizer(batch, return_tensors='pt', padding=True, truncation=True)
             tokens.to(device)
-            preds = hf_model(**tokens.data)
+            preds = hf_model(**tokens)
             softmax_probs += f.softmax(preds.logits, dim=1)[:,1].tolist()
         softmax_probs = np.array(softmax_probs)
         best_score_with_priors = softmax_probs.max()
@@ -249,7 +306,7 @@ def apply_sent_span_model(
         for batch in _batch(texts_with_afters):
             tokens = tokenizer(batch, return_tensors='pt', padding=True, truncation=True)
             tokens.to(device)
-            preds = hf_model(**tokens.data)
+            preds = hf_model(**tokens)
             softmax_probs += f.softmax(preds.logits, dim=1)[:,1].tolist()
 
         softmax_probs = np.array(softmax_probs)
@@ -258,11 +315,12 @@ def apply_sent_span_model(
             best_score = best_score_with_afters
             num_after = softmax_probs.argmax() + 1
 
-    # Return winning score, char span, and how many sentences it spans
+    # Return winning score, char span, how many sentences it spans, and the prefilter filter rate
     return best_score,\
         sent_boundaries[best_sent_idx - num_prior],\
         sent_boundaries[best_sent_idx + num_after + 1],\
-        1 + num_prior + num_after
+        1 + num_prior + num_after,\
+        filter_rate
 
 
 def attach_predictions(doc_df, tokenizer, sent_boundaries, model, batch_size=4, device='cpu'):
@@ -273,7 +331,7 @@ def attach_predictions(doc_df, tokenizer, sent_boundaries, model, batch_size=4, 
     """
     doc_df = doc_df.copy()
     for idx, instance in tqdm(doc_df.iterrows(), total=len(doc_df), desc=f'Applying model to docs on {device}'):
-        score, start, end, num_sents = apply_sent_span_model(
+        score, start, end, num_sents, filter_rate = apply_sent_span_model(
             instance.text, sent_boundaries[instance.id_doc], tokenizer, model,
             batch_size=batch_size, device=device
         )
@@ -281,6 +339,7 @@ def attach_predictions(doc_df, tokenizer, sent_boundaries, model, batch_size=4, 
         doc_df.at[idx, 'pred_char_start'] = start
         doc_df.at[idx, 'pred_char_end'] = end
         doc_df.at[idx, 'pred_num_sents'] = num_sents
+        doc_df.at[idx, 'prefilter_rate'] = filter_rate
 
     doc_df['int_labels'] = [0 if i == 'negative' else 1 for i in doc_df.label]
     threshold = utils.optimal_threshold(doc_df.pred_score, doc_df.int_labels)[0]

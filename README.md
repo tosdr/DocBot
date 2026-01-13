@@ -30,7 +30,7 @@ We also plan to release our datasets used for training/evaluation, which could b
 
 In a pip or conda environment, run:
 ```
-pip install requirements.txt
+pip install -r requirements.txt
 python -m spacy download en_core_web_md
 ```
 

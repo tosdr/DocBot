@@ -29,6 +29,7 @@ Uses Phoenix API enpoints (phoenix.py) to retrieve docs and points, and to POST 
 here = Path(__file__).parent
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+# logging.getLogger('src').setLevel(logging.DEBUG)
 
 MODEL_S3_BUCKET = 'tosdr-training'
 AWS_REGION = 'us-east-1'
@@ -55,7 +56,7 @@ class DocStore:
         # share a cache.
         # Update: since fetching/prepping docs is the slowest step, and we're seeing intermittent crashes from API DNS
         # failures, I'm adding a cache on disk so this is preserved across restarts.
-        self.cache_loc = here / '../data/doc_cache.pkl'
+        self.cache_loc = here / '../data/docbot_doc_cache.pkl'
         try:
             self.docs = pickle.load(open(self.cache_loc, 'rb'))
         except FileNotFoundError:
@@ -133,7 +134,7 @@ def run_case(
 ):
     if local_data:
         local_points = pd.read_pickle(here / f'../data/points_{apply_local.LOCAL_DUMP_VERSION}.pkl')
-        points = local_points[local_points.case_id == case_id]
+        points = local_points[local_points.case_id == case_id].copy()
     else:
         points_list = phoenix_client.get_points_for_case(case_id)
         # Turn list of dicts into a dataframe, to match the access pattern when local_data is True
@@ -142,6 +143,8 @@ def run_case(
     # Points document_id is a float, we'll want to turn it into a str for comparison (ideally this should be done earlier)
     points['document_id'] = points.document_id.apply(lambda doc_id: None if pd.isna(doc_id) else str(int(doc_id)))
 
+    # Model loading
+    prefilter_kwargs = inference.load_prefilter_kwargs(case_id)
     base_model = AutoModelForSequenceClassification.from_pretrained(inference.BASE_MODEL_NAME)
     model = load_peft_model(case_id, base_model, local_models)
     model = model.to(device)
@@ -158,6 +161,7 @@ def run_case(
 
     result_counts = defaultdict(int)
     result_scores = dict()
+    prefilter_rates = []
     for doc_id, text_version in doc_list:
         try:
             if (doc_id, text_version) in visited_docs:
@@ -207,9 +211,13 @@ def run_case(
                 if not pd.isna(point.quote_start) and not pd.isna(point.quote_end)
             ]
 
-            score, best_start, best_end, _ = inference.apply_sent_span_model(
-                doc['content'], doc['sent_boundaries'], tokenizer, model, batch_size, device, off_limits
+            score, best_start, best_end, _, filter_rate = inference.apply_sent_span_model(
+                doc['content'], doc['sent_boundaries'],
+                prefilter_kwargs,
+                tokenizer, model, batch_size, device,
+                off_limits
             )
+            prefilter_rates.append(filter_rate)
 
             # TODO we shouldn’t suggest case 216 if it conflicts with case 220; maybe other high-level rules
             # or should we handle this downstream, either in curator guide (/suggestion in UI) or in grading?
@@ -236,7 +244,7 @@ def run_case(
         except Exception as e:
             raise RuntimeError(f"Issue processing doc {doc_id} text_version {text_version} case {case_id}") from e
 
-    return result_counts, result_scores
+    return result_counts, result_scores, sum(prefilter_rates) / len(prefilter_rates) if len(prefilter_rates) > 0 else 0.
 
 def get_all_docs(local_data, phoenix_client) -> list[tuple[str, str]]:
     if local_data:
@@ -285,7 +293,7 @@ def run_all_cases(limit: int, local_models: bool, local_data: bool, dont_post: b
 
     # Load a list of case IDs
     if local_models:
-        case_id_strs = filter(lambda f: f.isdigit(), os.listdir(LOCAL_PEFT_PATH))
+        case_id_strs = filter(lambda f: f.isdigit(), os.listdir(apply_local.LOCAL_PEFT_PATH))
         case_ids = list(sorted(list(map(int, case_id_strs))))
     else:
         case_ids = list_case_models_s3(s3_client)
@@ -295,7 +303,7 @@ def run_all_cases(limit: int, local_models: bool, local_data: bool, dont_post: b
     doc_list = get_all_docs(local_data, phoenix_client)
     logger.info(f"Found {len(doc_list)} docs")
     if limit:
-        case_ids = [117, 134]
+        case_ids = [134]
         # case_ids = case_ids[:25]
         doc_list = doc_list[:limit]
         logger.info(f"Limiting to {len(doc_list)} docs, cases {case_ids}")
@@ -315,7 +323,7 @@ def run_all_cases(limit: int, local_models: bool, local_data: bool, dont_post: b
         logger.info(f"====================== Case {case_id} ({case_idx}/{len(case_ids)}) ========================")
         case_start_s = time.time()
 
-        result_counts, result_scores = run_case(
+        result_counts, result_scores, mean_prefilter_rate = run_case(
             case_id, local_models, local_data, dont_post,
             doc_list, doc_store, phoenix_client, inference.THRESHOLDS[case_id], batch_size, device
         )
@@ -325,6 +333,7 @@ def run_all_cases(limit: int, local_models: bool, local_data: bool, dont_post: b
         case_result_scores[case_id] = result_scores
 
         logger.info(f"Case {case_id} took {time.time() - case_start_s:.2f} seconds to process")
+        logger.info(f"Mean filter rate for TF-IDF prefilter: {100 * mean_prefilter_rate:.2f}%")
         logger.info(f"Results:\n\t{dict(result_counts)}")
         if len(result_scores) > 0:
             logger.info(f"Prediction scores:\n{pd.Series(list(result_scores.values())).describe()}")

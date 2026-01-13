@@ -1,5 +1,6 @@
 data
 !data/*.pkl
+!data/models/tfidf_v1
 logs
 wandb
 notebooks
