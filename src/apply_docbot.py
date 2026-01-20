@@ -140,8 +140,8 @@ def run_case(
         # Turn list of dicts into a dataframe, to match the access pattern when local_data is True
         points = pd.DataFrame(points_list)
     logger.info(f"Found {len(points)} points")
-    # Points document_id is a float, we'll want to turn it into a str for comparison (ideally this should be done earlier)
-    points['document_id'] = points.document_id.apply(lambda doc_id: None if pd.isna(doc_id) else str(int(doc_id)))
+    # Points document_id is a float, we'll want to turn it into a int for comparison (ideally this should be done earlier)
+    points['document_id'] = points.document_id.apply(lambda doc_id: None if pd.isna(doc_id) else int(doc_id))
 
     # Model loading
     prefilter_kwargs = inference.load_prefilter_kwargs(case_id)
@@ -246,7 +246,7 @@ def run_case(
 
     return result_counts, result_scores, sum(prefilter_rates) / len(prefilter_rates) if len(prefilter_rates) > 0 else 0.
 
-def get_all_docs(local_data, phoenix_client) -> list[tuple[str, str]]:
+def get_all_docs(local_data, phoenix_client) -> list[tuple[int, str]]:
     if local_data:
         ids = pd.read_pickle(here / f'../data/documents_{apply_local.LOCAL_DUMP_VERSION}.pkl').id.values
         # There was no text_version in the older documents schema, so just pretend they're all '0'

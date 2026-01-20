@@ -6,7 +6,7 @@ pandas
 peft
 protobuf==3.20
 requests
-scikit-learn
+scikit-learn==1.4
 seaborn
 spacy
 sqlalchemy
