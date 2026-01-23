@@ -1,10 +1,7 @@
 import backoff
-import errno
-import functools
 import json
 import logging
 import os
-import signal
 import time
 
 import requests
@@ -17,48 +14,15 @@ Client for Phoenix APIs necessary to run our models in production
 """
 
 def _backoff_handler(details):
-    logger.info("Backing off {wait:0.1f} seconds after {tries} tries calling phoenix with args {args} and kwargs "
-                "{kwargs}".format(**details))
+    msg = f"Backing off {details['wait']:0.1f} seconds after {details['tries']} tries calling {details['args'][1]}"
+    if 'params' in details['kwargs']:
+        msg += f" with kwargs {details['kwargs']['params']}"
+    logger.debug(msg)
 
 def _assert_int(n):
     if not isinstance(n, int):
         raise ValueError(f"{n} is not an int?")
     return n
-
-"""
-At one point requests.request() hung indefinitely with:
-  File "/opt/conda/lib/python3.11/ssl.py", line 517, in wrap_socket
-    return self.sslsocket_class._create(
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/opt/conda/lib/python3.11/ssl.py", line 1104, in _create
-    self.do_handshake()
-  File "/opt/conda/lib/python3.11/ssl.py", line 1382, in do_handshake
-    self._sslobj.do_handshake()
-
-Apparently this is rare but the only way around it is to timeout the function:
-https://bugs.python.org/issue34438
-https://stackoverflow.com/questions/19938593/web-app-hangs-for-several-hours-in-ssl-py-at-self-sslobj-do-handshake
-https://stackoverflow.com/questions/2281850/timeout-function-if-it-takes-too-long-to-finish
-"""
-# note this is not thread safe
-def timeout(seconds=60, error_message=os.strerror(errno.ETIME)):
-    def decorator(func):
-        def _handle_timeout(signum, frame):
-            raise RuntimeError(error_message)
-
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            signal.signal(signal.SIGALRM, _handle_timeout)
-            signal.alarm(seconds)
-            try:
-                result = func(*args, **kwargs)
-            finally:
-                signal.alarm(0)
-            return result
-
-        return wrapper
-
-    return decorator
 
 
 class Client:
@@ -70,12 +34,14 @@ class Client:
         except KeyError:
             raise EnvironmentError(f"Environment variables PHOENIX_API_URL and PHOENIX_API_KEY not set")
 
-    @timeout()
     def _request(self, request_kwargs: dict):
-        # print(f"{**request_kwargs}")
+        # Timeout for requests - handles SSL hangs that can occur during do_handshake()
+        # See: https://bugs.python.org/issue34438
+        # (connect_timeout, read_timeout) in seconds
+        request_kwargs.setdefault('timeout', (30, 120))
         return requests.request(**request_kwargs)
 
-    @backoff.on_exception(backoff.expo, RuntimeError, max_time=900, on_backoff=_backoff_handler)
+    @backoff.on_exception(backoff.expo, RuntimeError, max_time=300, on_backoff=_backoff_handler, logger=None)
     def _call(
             self, path: str, method: str, is_private: bool, desc: str, allow_404: bool=False, params: dict=None,
             payload: dict=None
@@ -180,24 +146,17 @@ class Client:
         else:
             raise RuntimeError(f"Unexpected response code {res.status_code} from GET DocbotRecords?")
 
-    def add_docbot_record(
-            self, case_id, doc_id, text_version, docbot_version,
-            char_start=None, char_end=None, ml_score=None
-    ):
+
+    def add_docbot_records(self, records: list[dict]):
+        if not records:
+            return
+
         res = self._call(
             '/docbotrecord/v1',
             'post',
             True,
-            desc="POST DocbotRecord",
-            params={
-                'case_id': case_id,
-                'document_id': doc_id,
-                'text_version': text_version,
-                'docbot_version': docbot_version,
-                'char_start': char_start,
-                'char_end': char_end,
-                'ml_score': ml_score
-            }
+            desc="POST DocbotRecords",
+            payload={'records': records}
         )
         if res.status_code != 201:
-            raise RuntimeError(f"Not a 201 when POSTing DocbotRecord, returned {res.status_code}")
+            raise RuntimeError(f"Not a 201 when bulk POSTing DocbotRecords, returned {res.status_code}")

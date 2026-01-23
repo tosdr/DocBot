@@ -11,5 +11,6 @@ seaborn
 spacy
 sqlalchemy
 textacy
+tqdm
 transformers
 torch

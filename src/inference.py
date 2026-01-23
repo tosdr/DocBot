@@ -183,30 +183,31 @@ def load_prefilter_kwargs(case_id):
 
 def apply_prefilter(
         text: str, sent_boundaries: list[int], vectorizer, model, threshold, spacy_model
-) -> tuple[list[tuple[int, int]], float]:
+) -> tuple[np.ndarray, float]:
     """
     Applies a high-recall TF-IDF classification model as a prefilter. Must let at least one sentence through the filter,
     because the caller's job is to find the most likely sentence.
-    :return: a list of off-limits spans of the text (character start/end position), and a float filter rate so we can
-        track how much inference we're saving.
+    :return: a boolean array (True = sentence is filtered/offlimits) indexed by sentence, and a float filter rate
+        so we can track how much inference we're saving.
     """
+    num_sentences = len(sent_boundaries) - 1
     terms: list[list[str]] = []
-    for sent_idx in range(len(sent_boundaries) - 1):
+    for sent_idx in range(num_sentences):
         sent_text = text[sent_boundaries[sent_idx]:sent_boundaries[sent_idx + 1]]
         terms.append([span.text.lower() for span in extract.ngrams(spacy_model(sent_text), n=[1, 2])])
 
     # Sparse matrix of term counts
-    sentence_vectors = vectorizer.fit_transform(terms)
+    sentence_vectors = vectorizer.transform(terms)
     pred_proba = model.predict_proba(sentence_vectors)[:, 1]
     max_prob_idx = pred_proba.argmax()
 
-    offlimits = []
-    for sent_idx in range(len(sent_boundaries) - 1):
-        if sent_idx != max_prob_idx and pred_proba[sent_idx] < threshold:
-            offlimits.append((sent_boundaries[sent_idx], sent_boundaries[sent_idx + 1]))
+    # Boolean array: True means sentence is filtered out
+    prefilter_mask = pred_proba < threshold
+    # Always let through the highest-probability sentence
+    prefilter_mask[max_prob_idx] = False
 
-    return offlimits, len(offlimits) / len(sent_boundaries)
-
+    filter_rate = prefilter_mask.sum() / num_sentences
+    return prefilter_mask, filter_rate
 
 def apply_sent_span_model(
         text: str, sent_boundaries: list[int],
@@ -216,7 +217,7 @@ def apply_sent_span_model(
 ) -> tuple[float, int, int, int, float]:
     """
     Takes a model that was trained for text classification on sentence spans (usually 1 or 2, but potentially 5+)
-    and applies it to full documents.
+    and applies it to full documents to find the highest scoring span.
     First applies a two-phase model to every sentence, finding the maximum score: phase 1 is a fast TF-IDF model that
     narrows it down to relevant sentences, phase 2 is a fine-tuned BERT classifier.
 
@@ -227,24 +228,31 @@ def apply_sent_span_model(
     Char spans can be marked as off limits with list[tuple(int, int)] off_limits. This is so that in production we can
     avoid re-suggesting a point that was declined by a curator.
 
-    Returns the winning score, the winning char span, how many sentences it spans, and the prefilter filter rate
+    Returns the winning score, the winning char span, how many sentences it spans, and the prefilter filter rate.
+    In rare cases returns None (only if the entire doc was marked as off_limits)
     """
     if off_limits is None:
         off_limits = []
     sent_boundaries = sent_boundaries + [None]
+    num_sentences = len(sent_boundaries) - 1
 
     # Most of the sentences we can quickly disqualify by testing for key terms, via a TF-IDF classifier prefilter
     #TODO precompute / use doc cache for prefilter tokenization so they are shared between cases?
-    filtered_sents, filter_rate = apply_prefilter(text, sent_boundaries, **prefilter_kwargs)
-    off_limits += filtered_sents
+    prefilter_mask, filter_rate = apply_prefilter(text, sent_boundaries, **prefilter_kwargs)
     logger.debug(f"TF-IDF prefilter applied with filter rate {filter_rate:.2f}")
 
-    def _is_overlapping(start, end):
-        return any([((off_end is None or off_end > start) and (end is None or off_start < end))
-                    for off_start, off_end in off_limits])
+    # Convert user-provided off_limits spans to a sentence mask
+    user_mask = np.zeros(num_sentences, dtype=bool)
+    for off_start, off_end in off_limits:
+        for i in range(num_sentences):
+            sent_start = sent_boundaries[i]
+            sent_end = sent_boundaries[i + 1]
+            # Check overlap: sentence overlaps with off_limits span if they intersect
+            if (sent_end is None or off_start < sent_end) and (off_end is None or sent_start < off_end):
+                user_mask[i] = True
 
-    sent_off_limits = [_is_overlapping(sent_boundaries[i], sent_boundaries[i+1])
-                       for i in range(len(sent_boundaries) - 1)]
+    # Combine prefilter mask with user-provided off_limits
+    sent_off_limits = prefilter_mask | user_mask
 
     def _batch(iterable, n=batch_size):
         l = len(iterable)
@@ -252,6 +260,10 @@ def apply_sent_span_model(
             yield iterable[idx: min(idx + n, l)]
 
     valid_sent_indices = np.where(~np.array(sent_off_limits))[0]
+    # Edge case: if the entire document is off limits, there's nothing to return
+    if len(valid_sent_indices) == 0:
+        return None
+
     sent_texts = [text[sent_boundaries[i]: sent_boundaries[i + 1]] for i in valid_sent_indices]
     softmax_probs = []
     for batch in _batch(sent_texts):
@@ -331,15 +343,17 @@ def attach_predictions(doc_df, tokenizer, sent_boundaries, model, batch_size=4, 
     """
     doc_df = doc_df.copy()
     for idx, instance in tqdm(doc_df.iterrows(), total=len(doc_df), desc=f'Applying model to docs on {device}'):
-        score, start, end, num_sents, filter_rate = apply_sent_span_model(
+        ret = apply_sent_span_model(
             instance.text, sent_boundaries[instance.id_doc], tokenizer, model,
             batch_size=batch_size, device=device
         )
-        doc_df.at[idx, 'pred_score'] = score
-        doc_df.at[idx, 'pred_char_start'] = start
-        doc_df.at[idx, 'pred_char_end'] = end
-        doc_df.at[idx, 'pred_num_sents'] = num_sents
-        doc_df.at[idx, 'prefilter_rate'] = filter_rate
+        if ret is not None:
+            score, start, end, num_sents, filter_rate = ret
+            doc_df.at[idx, 'pred_score'] = score
+            doc_df.at[idx, 'pred_char_start'] = start
+            doc_df.at[idx, 'pred_char_end'] = end
+            doc_df.at[idx, 'pred_num_sents'] = num_sents
+            doc_df.at[idx, 'prefilter_rate'] = filter_rate
 
     doc_df['int_labels'] = [0 if i == 'negative' else 1 for i in doc_df.label]
     threshold = utils.optimal_threshold(doc_df.pred_score, doc_df.int_labels)[0]

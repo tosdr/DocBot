@@ -43,7 +43,8 @@ def run_ad_hoc(text_file_paths: list, device='mps', batch_size=16):
     :param batch_size:
     :return:
     """
-    case_ids = list(sorted(list_case_models()))
+    # case_ids = list(sorted(list_case_models()))
+    case_ids = [201]
 
     logger.info(f"Loading spacy model")
     spacy_model = spacy.load('en_core_web_md', disable=['attribute_ruler', 'lemmatizer', 'ner'])
@@ -74,19 +75,20 @@ def run_ad_hoc(text_file_paths: list, device='mps', batch_size=16):
         model = PeftModel.from_pretrained(base_model, peft_path(case_id)).merge_and_unload()
         model = model.to(device)
         tokenizer = AutoTokenizer.from_pretrained(inference.BASE_MODEL_NAME)
+        prefilter_kwargs = inference.load_prefilter_kwargs(case_id)
 
         for filename, boundaries, text in zip(filenames, sent_boundaries, texts):
-            score, best_start, best_end, _, __ = inference.apply_sent_span_model(
-                text, boundaries, tokenizer, model, batch_size, device, off_limits=None
+            ret = inference.apply_sent_span_model(
+                text, boundaries, prefilter_kwargs, tokenizer, model, batch_size, device, off_limits=None
             )
-            evidence_str = text[best_start:best_end]
+            if ret is not None:
+                score, best_start, best_end, _, __ = ret
+                evidence_str = text[best_start:best_end]
 
-            if score >= inference.THRESHOLDS[case_id]:
-                logger.info(f"{filename} scored {score:.3f} from {best_start}-{best_end} with:\n{evidence_str}")
+                if score >= inference.THRESHOLDS[case_id]:
+                    logger.info(f"{filename} scored {score:.3f} from {best_start}-{best_end} with:\n{evidence_str}")
 
 if __name__ == '__main__':
     run_ad_hoc([
-        'centurytech.txt',
-        'renaissance_terms.txt',
-        'whizz_privacy_students.txt',
+        'doc.txt',
     ])
