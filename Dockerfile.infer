@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1
+#TODO upgrade to pytorch/pytorch:2.10.0-cuda12.8-cudnn9-runtime
 FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime as build
 
+#TODO python 3.12 upgrade
 RUN conda init bash && \
     . ~/.bashrc && \
     yes | conda create -n tosdr python=3.9 && \

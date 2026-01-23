@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1
-FROM pytorch/pytorch:1.13.1-cuda11.6-cudnn8-runtime as build
+FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-runtime as build
 
 RUN conda init bash && \
     . ~/.bashrc && \
-    yes | conda create -n tosdr python=3.9 && \
+    yes | conda create -n tosdr python=3.12 && \
     conda activate tosdr
 
 COPY requirements.txt /requirements.txt

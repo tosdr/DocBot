@@ -1,17 +1,16 @@
 # Requirements for research and training
-boto3
+boto3==1
 datasets
 langdetect
-pandas
+pandas==2
 peft
-prefect
-prefect-aws
 pytest
-scikit-learn
+scikit-learn==1.8
 seaborn
-spacy
+spacy==3
 sqlalchemy
 textacy
-transformers
-torch
+tqdm
+transformers==4
+torch==2.10
 wandb

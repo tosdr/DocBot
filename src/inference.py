@@ -214,7 +214,7 @@ def apply_sent_span_model(
         prefilter_kwargs,
         tokenizer, hf_model, batch_size, device,
         off_limits: list[tuple[int, int]]=None
-) -> tuple[float, int, int, int, float]:
+) -> None | tuple[float, int, int, int, float]:
     """
     Takes a model that was trained for text classification on sentence spans (usually 1 or 2, but potentially 5+)
     and applies it to full documents to find the highest scoring span.
