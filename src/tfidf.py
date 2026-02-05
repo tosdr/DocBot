@@ -26,7 +26,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 here = Path(__file__).parent
 
-DB_DUMP_VERSION = '211222'
+DB_DUMP_VERSION = '280126'
 # We'll only train models for Cases that have deep learning models trained
 CASE_IDS = list(sorted(inference.THRESHOLDS.keys()))
 RANDOM_STATE = 0
@@ -569,16 +569,16 @@ def extract_ngrams(case_dataset):
     return ngrams, sentence_labels
 
 def run():
-    documents = pickle.load(open(here / f'../data/documents_{DB_DUMP_VERSION}_clean.pkl', 'rb'))
-    points = pickle.load(open(here / f'../data/points_{DB_DUMP_VERSION}_clean.pkl', 'rb'))
-    services = pickle.load(open(here / f'../data/services_{DB_DUMP_VERSION}_clean.pkl', 'rb'))
+    documents = pickle.load(open(here / f'../data/db_dumps/{DB_DUMP_VERSION}/documents_clean.pkl', 'rb'))
+    points = pickle.load(open(here / f'../data/db_dumps/{DB_DUMP_VERSION}/points_clean.pkl', 'rb'))
+    services = pickle.load(open(here / f'../data/db_dumps/{DB_DUMP_VERSION}/services_clean.pkl', 'rb'))
 
     # Create cache and results directories
     cache_dir = Path(here / '../data/tfidf')
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     # Try to load cached prep_datasets result
-    prep_cache = cache_dir / 'prep_datasets.pkl'
+    prep_cache = cache_dir / f'{DB_DUMP_VERSION}_datasets_cache.pkl'
     try:
         positives, negatives = pickle.load(open(prep_cache, 'rb'))
         logger.info("Loaded prep_datasets from cache")

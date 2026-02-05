@@ -39,17 +39,11 @@ python -m spacy download en_core_web_md
 We create training corpora from database dumps. The first step is to convert from sql to pandas.
 
 - Start postgresql (on a mac: `brew services restart postgresql`)
-- Run `createdb tosdr`
-- In the interactive REPL (`psql -d tosdr`), run `create user phoenix with superuser; ALTER ROLE "phoenix" WITH LOGIN;`
-- Comment out any foreign key setups, found at the bottom of the sql files.
-- Log into psql with `psql -d tosdr -U phoenix`
-- `\i services.sql`
-- `\i topics.sql`
-- `\i documents.sql`
-- `\i cases.sql`
-- `\i points.sql`
-- Confirm all 5 tables exist with `\dt public.*` (you might have to log out and back in). Tables can be inspected with i.e. `\d+ public.topics`
-- Run `sql_to_pandas.py` to load the tables and save them as pickled pandas DataFrames in `data`
+- Run `createdb phoenix`
+- In the interactive REPL (`psql -d phoenix`), run `create user phoenix with superuser; ALTER ROLE "phoenix" WITH LOGIN;`
+- `pg_restore -d phoenix -cC path/to/dump.sql`
+- Log into psql with `psql -d phoenix -U phoenix`, confirm all tables exist with `\dt`. Tables can be inspected with i.e. `\d+ topics`
+- Run `sql_to_pandas.py` to load the tables and save them as pickled pandas DataFrames in `data/db_dumps/`
 
 ### Creating datasets
 

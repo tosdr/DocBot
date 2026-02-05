@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 here = Path(__file__).parent
 
 LOCAL_PEFT_PATH = here / f'../data/models/{MODEL_VERSION}/'
-LOCAL_DUMP_VERSION = '211222'
+LOCAL_DUMP_VERSION = '280126'
 
 
 def list_case_models() -> set[int]:

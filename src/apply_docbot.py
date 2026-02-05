@@ -61,7 +61,8 @@ class DocStore:
 
         self.local_data = local_data
         self.phoenix_client = phoenix_client
-        self.local_docs = pd.read_pickle(here / f'../data/documents_{apply_local.LOCAL_DUMP_VERSION}.pkl')
+        # Non-clean version to match the DB
+        self.local_docs = pd.read_pickle(here / f'../data/db_dumps/{apply_local.LOCAL_DUMP_VERSION}/documents.pkl')
 
         # Since we plan to use one machine we can just cache docs here. It we scale up to a big cluster we can have them
         # share a cache.
@@ -163,7 +164,7 @@ def run_case(
         tokenizer=None
 ):
     if local_data:
-        local_points = pd.read_pickle(here / f'../data/points_{apply_local.LOCAL_DUMP_VERSION}.pkl')
+        local_points = pd.read_pickle(here / f'../data/db_dumps/{apply_local.LOCAL_DUMP_VERSION}/points.pkl')
         points = local_points[local_points.case_id == case_id].copy()
     else:
         points_list = phoenix_client.get_points_for_case(case_id)
@@ -324,7 +325,8 @@ def run_case(
 
 def get_all_docs(local_data, phoenix_client) -> list[tuple[int, str]]:
     if local_data:
-        ids = pd.read_pickle(here / f'../data/documents_{apply_local.LOCAL_DUMP_VERSION}.pkl').id.values
+        # Non-clean version to match the DB
+        ids = pd.read_pickle(here / f'../data/db_dumps/{apply_local.LOCAL_DUMP_VERSION}/documents.pkl').id.values
         # There was no text_version in the older documents schema, so just pretend they're all '0'
         return [(i, '0') for i in ids]
     else:
@@ -334,7 +336,7 @@ def list_case_models_s3(s3_client) -> list[int]:
     case_ids = set()
     list_result = s3_client.list_objects(Bucket=MODEL_S3_BUCKET, Prefix=f'{MODEL_VERSION}/')
     for object_key in map(operator.itemgetter('Key'), list_result['Contents']):
-        match = re.match(f'^{MODEL_VERSION}/(\d+)/adapter_model.bin', object_key)
+        match = re.match(rf'^{MODEL_VERSION}/(\d+)/adapter_model.bin', object_key)
         if match is not None:
             case_ids.add(int(match.groups()[0]))
     return list(sorted(case_ids))

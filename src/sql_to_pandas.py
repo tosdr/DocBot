@@ -1,28 +1,27 @@
 import logging
 from pathlib import Path
 
-import pandas
+import pandas as pd
 from sqlalchemy import create_engine
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 here = Path(__file__).parent
 
-DB_URL = f'postgresql+psycopg2://phoenix:@127.0.0.1:5432/tosdr'
-TABLES = {'cases', 'documents', 'points', 'services', 'topics', 'reasons'}
-VERSION = '211222'  # day month year
-DATA_DIR = here / 'data'
+DB_URL = f'postgresql+psycopg2://phoenix:@127.0.0.1:5432/phoenix'
+TABLES = {'cases', 'documents', 'points', 'services', 'topics'}
+VERSION = '280126'  # day month year
+DUMP_DIR = here / f'../data/db_dumps/{VERSION}'
 
 def convert(table_name):
-    sql_path = DATA_DIR / f'{table_name}_{VERSION}.sql'
-    df = pandas.read_sql_table(table_name, create_engine(DB_URL))
+    df = pd.read_sql_table(table_name, create_engine(DB_URL))
     # Set the DataFrame index to the `id` column from sql
     df = df.set_index(df.id, drop=True)
     logger.info(f"{table_name} size: {len(df)}")
 
-    out_path = sql_path.with_name(f'{table_name}_{VERSION}.pkl')
+    out_path = DUMP_DIR / f'{table_name}.pkl'
     df.to_pickle(out_path)
-    logger.info(f"Converted {sql_path.relative_to(here)} to {out_path.relative_to(here)}")
+    logger.info(f"Exported to {out_path.relative_to(here)}")
 
 
 if __name__ == '__main__':

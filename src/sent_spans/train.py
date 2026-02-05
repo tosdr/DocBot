@@ -29,7 +29,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 here = Path(__file__).parent
 
-DB_DUMP_VERSION = '211222'
+DB_DUMP_VERSION = '280126'
 CLASSIFICATION_VERSION = make_classification_datasets.LATEST_VERSION
 RESULTS_S3_BUCKET = 'tosdr-training'
 
@@ -268,7 +268,7 @@ def results_by_case(results_key) -> pd.DataFrame:
     doc_output_path = here / f'../../data/results/{results_key}/doc_pred.pkl'
     sent_span_results = pickle.load(open(sent_span_output_path, 'rb'))
     doc_results = pickle.load(open(doc_output_path, 'rb'))
-    cases = pickle.load(open(here / f'../../data/cases_{DB_DUMP_VERSION}_clean.pkl', 'rb'))
+    cases = pickle.load(open(here / f'../../data/db_dump/{DB_DUMP_VERSION}/cases_clean.pkl', 'rb'))
     for case_id in sent_span_results:
         # The sent span eval logic at the end sets a "pred" score float. We'll find the optimal threshold that maximizes f1
         eval_set = sent_span_results[case_id][~sent_span_results[case_id].pred.isna()]

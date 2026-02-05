@@ -16,15 +16,15 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 here = Path(__file__).parent
 
-MIN_APPROVED = 40     # Focus on cases with enough approved points to fine-tunen and evaluate
+MIN_APPROVED = 40     # Focus on cases with enough approved points to fine-tune and evaluate
 NUM_FOLDS = 5         # Pre-determined train-test splits for downstream ML
 
-DB_DUMP_VERSION = '211222'
-LATEST_VERSION = '211222_v2_corrected_5-28-23'
+DB_DUMP_VERSION = '280126'
+LATEST_VERSION = '280126_v0'
 
 # Outputs are saved here
-SENT_SPAN_LOC = here / f'../data/sent_span_classification_{LATEST_VERSION}.pkl'
-DOC_LOC = here / f'../data/doc_classification_{LATEST_VERSION}.pkl'
+SENT_SPAN_LOC = here / f'../data/db_dumps/{DB_DUMP_VERSION}/sent_span_classification_{LATEST_VERSION}.pkl'
+DOC_LOC = here / f'../data/db_dumps/{DB_DUMP_VERSION}/doc_classification_{LATEST_VERSION}.pkl'
 
 """
 This module takes database dumps (cleaned up by explore.ipynb) and forms two binary text classification datasets
