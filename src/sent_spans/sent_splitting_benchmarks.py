@@ -10,7 +10,7 @@ from src import utils
 
 here = Path(__file__).parent
 
-VERSION = '181021'
+VERSION = '2026-01-28'
 USE_PARSER_SENTS = True
 USE_MD = True
 
@@ -41,7 +41,7 @@ if __name__ == '__main__':
     # Also join to attach Case info
     points = pd.merge(points, cases, left_on='case_id', right_index=True, suffixes=['_point', '_case'])
 
-    points['quote_len'] = points.quoteEnd - points.quoteStart
+    points['quote_len'] = points.quote_end - points.quote_start
     approved_points = points[points.status == 'approved']
 
     # There's no need to analyze docs without Points
@@ -67,7 +67,7 @@ if __name__ == '__main__':
         sents = list(filter(lambda sent: sent.text != '' and not sent.text.isspace(), doc.sents))
         sent_starts = list(sorted(map(lambda s: s.start_char, sents)))
         for point_id, point in points[points.document_id == doc_id].iterrows():
-            num_sents = (1 + (bisect.bisect_right(sent_starts, point.quoteEnd) - bisect.bisect_right(sent_starts, point.quoteStart)))
+            num_sents = (1 + (bisect.bisect_right(sent_starts, point.quote_end) - bisect.bisect_right(sent_starts, point.quote_start)))
             points.at[point_id, 'num_sents'] = num_sents
 
     end = time.time()

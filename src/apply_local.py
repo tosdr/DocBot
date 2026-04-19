@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 here = Path(__file__).parent
 
 LOCAL_PEFT_PATH = here / f'../data/models/{MODEL_VERSION}/'
-LOCAL_DUMP_VERSION = '280126'
+LOCAL_DUMP_VERSION = '2026-01-28'
 
 
 def list_case_models() -> set[int]:
@@ -89,6 +89,4 @@ def run_ad_hoc(text_file_paths: list, device='mps', batch_size=16):
                     logger.info(f"{filename} scored {score:.3f} from {best_start}-{best_end} with:\n{evidence_str}")
 
 if __name__ == '__main__':
-    run_ad_hoc([
-        'doc.txt',
-    ])
+    run_ad_hoc(['doc.txt',])

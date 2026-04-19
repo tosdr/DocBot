@@ -29,7 +29,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 here = Path(__file__).parent
 
-DB_DUMP_VERSION = '280126'
+DB_DUMP_VERSION = '2026-01-28'
 CLASSIFICATION_VERSION = make_classification_datasets.LATEST_VERSION
 RESULTS_S3_BUCKET = 'tosdr-training'
 
@@ -103,7 +103,7 @@ def finetune(
     input_cases = sent_spans_df.copy()
     # To make logs quieter
     input_cases = input_cases.drop(
-        ['service_id', 'quoteStart', 'char_end', 'status', 'point_id', 'quoteEnd', 'source', 'sent_idx_start',
+        ['service_id', 'quote_start', 'char_end', 'status', 'point_id', 'quote_end', 'source', 'sent_idx_start',
          'sent_idx_end', 'quoteText', 'case_id', 'char_start', 'document_id', 'num_sents', 'lang', 'title'], axis=1)
     input_cases['label'] = (input_cases.label == 'positive').astype(int)
 

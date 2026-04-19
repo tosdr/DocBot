@@ -68,9 +68,9 @@ Data that was removed:
 - Services that lack any Documents, and associated Points
 - Points marked as `[disputed, changes-requested, pending, draft]` (only ~60)
 - Documents without text (~1.5k) and associated Points
-- A handful of Points that have a `quoteStart` but no `quoteText`
-- Points with `quoteText` that no longer matches `document.text[point.quoteStart:point.quoteEnd]`, likely due to re-crawled text that changed. About 2k, 
-down from 3k (1k were saved by re-searching for the quote and updating `quoteStart`/`quoteEnd`)
+- A handful of Points that have a `quote_start` but no `quoteText`
+- Points with `quoteText` that no longer matches `document.text[point.quote_start:point.quote_end]`, likely due to re-crawled text that changed. About 2k, 
+down from 3k (1k were saved by re-searching for the quote and updating `quote_start`/`quote_end`)
 - [Service 502](https://edit.tosdr.org/services/502), [Case 235](https://edit.tosdr.org/cases/235), [Topic 53](https://edit.tosdr.org/topics/53), Document 1378, and all associated Points 
 
 Data that was kept for now in case they're useful:

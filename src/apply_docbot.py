@@ -193,7 +193,9 @@ def run_case(
         visited_docs = phoenix_client.get_docbot_records(case_id, MODEL_VERSION)
         logger.info(f"{len(visited_docs)} records found for case {case_id} version {MODEL_VERSION}")
 
+    # Maps from string status (found, not found, skipped, etc.) to a count for how many docs had that status
     result_counts = defaultdict(int)
+    # Maps from a doc ID to a dict with score, best_start_char, best_end_char, filter_rate
     result_scores = dict()
     prefilter_rates = []
 
@@ -294,7 +296,9 @@ def run_case(
                     if success:
                         logger.info(f"\n✅ Doc {doc_id} scored {score:.3f} with span:\n{doc['content'][best_start:best_end]}")
                     result_counts['ran_found' if success else 'ran_notfound'] += 1
-                    result_scores[doc_id] = score
+                    result_scores[doc_id] = {
+                        'score': score, 'best_start': best_start, 'best_end': best_end, 'filter_rate': filter_rate,
+                    }
 
                     if not dont_post:
                         # Submit a quote using the original text (with HTML) as opposed to doc['content']
@@ -419,7 +423,8 @@ def run_all_cases(limit: int, local_models: bool, local_data: bool, dont_post: b
         logger.info(f"Mean filter rate for TF-IDF prefilter: {100 * mean_prefilter_rate:.2f}%")
         logger.info(f"Results:\n\t{dict(result_counts)}")
         if len(result_scores) > 0:
-            logger.info(f"Prediction scores:\n{pd.Series(list(result_scores.values())).describe()}")
+            pred_scores = [d['score'] for d in result_scores.values()]
+            logger.info(f"Prediction scores:\n{pd.Series(pred_scores).describe()}")
 
         # Serialize latest results in case of crash
         # Get new S3 credentials in case the 12 hour limit ran out

@@ -26,7 +26,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 here = Path(__file__).parent
 
-DB_DUMP_VERSION = '280126'
+DB_DUMP_VERSION = '2026-01-28'
 # We'll only train models for Cases that have deep learning models trained
 CASE_IDS = list(sorted(inference.THRESHOLDS.keys()))
 RANDOM_STATE = 0
@@ -507,7 +507,7 @@ def prep_datasets(documents, points, services, num_negative_docs=600, sents_per_
         approved = approved_points[approved_points.case_id == case_id].copy()
         approved['text'] = approved['quoteText']
         approved['point_id'] = approved['id']
-        positives[case_id] = approved[['point_id', 'case_id', 'quoteStart', 'quoteEnd', 'document_id', 'text']]
+        positives[case_id] = approved[['point_id', 'case_id', 'quote_start', 'quote_end', 'document_id', 'text']]
 
     negatives = []
     for i, (doc_id, doc) in tqdm(
@@ -524,7 +524,7 @@ def prep_datasets(documents, points, services, num_negative_docs=600, sents_per_
         case_offlimits: dict[int, list[tuple[int, int]]] = dict()
         for case_id in doc_points.case_id.unique():
             case_points = doc_points[doc_points.case_id == case_id]
-            case_offlimits[case_id] = [(int(s), int(e)) for s, e in zip(case_points.quoteStart, case_points.quoteEnd)]
+            case_offlimits[case_id] = [(int(s), int(e)) for s, e in zip(case_points.quote_start, case_points.quote_end)]
 
         random.shuffle(doc_sents)
         for sent in doc_sents[:sents_per_doc]:
@@ -536,8 +536,8 @@ def prep_datasets(documents, points, services, num_negative_docs=600, sents_per_
                             offlimits_cases.append(case_id)
                 negatives.append({
                     'document_id': doc_id,
-                    'quoteStart': sent.start_char,
-                    'quoteEnd': sent.end_char,
+                    'quote_start': sent.start_char,
+                    'quote_end': sent.end_char,
                     'text': sent.text,
                     'offlimits_cases': offlimits_cases
                 })
