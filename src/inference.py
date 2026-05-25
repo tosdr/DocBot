@@ -261,9 +261,9 @@ def apply_sent_span_model(
     sent_off_limits = prefilter_mask | user_mask
 
     def _batch(iterable, n=batch_size):
-        l = len(iterable)
-        for idx in range(0, l, n):
-            yield iterable[idx: min(idx + n, l)]
+        iter_len = len(iterable)
+        for idx in range(0, iter_len, n):
+            yield iterable[idx: min(idx + n, iter_len)]
 
     valid_sent_indices = np.where(~np.array(sent_off_limits))[0]
     # Edge case: if the entire document is off limits, there's nothing to return

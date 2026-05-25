@@ -568,7 +568,7 @@ def run():
         logger.info(f"{'=' * 30} Case {case_id} {'=' * 30}")
         logger.info("Sentence spans:")
         logger.info(f"\t{sent_span_datasets[case_id].source.value_counts()}")
-        logger.info(f"Documents:")
+        logger.info("Documents:")
         logger.info(f"\t{doc_datasets[case_id].source.value_counts()}")
         logger.info(f"Sent span folds: {sent_span_datasets[case_id].fold.value_counts()}")
         logger.info(f"Doc folds: {doc_datasets[case_id].fold.value_counts()}")

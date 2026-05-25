@@ -17,7 +17,7 @@ AWS_REGION = 'us-east-1'
 
 def parallel_queue_name():
     if 'AWS_ACCOUNT' not in os.environ:
-        raise RuntimeError(f"Set AWS_ACCOUNT env variable to use parallel training")
+        raise RuntimeError("Set AWS_ACCOUNT env variable to use parallel training")
     return f'https://sqs.us-east-1.amazonaws.com/{os.environ["AWS_ACCOUNT"]}/tosdr-training.fifo'
 
 def push(case_ids: list, parallel_key: str, empty_assert_timeout=30):

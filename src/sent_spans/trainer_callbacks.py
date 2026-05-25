@@ -46,7 +46,7 @@ class DocEvalCallback(TrainerCallback):
             self.eval_count += 1
             return
         self.eval_count += 1
-        logger.info(f"======= Evaluating doc dataset =======")
+        logger.info("======= Evaluating doc dataset =======")
         doc_df = self.doc_df.copy()
         # For some reason this takes more memory than during training, so cut batch size in half
         doc_df = inference.attach_predictions(
@@ -89,6 +89,6 @@ class EvalTrainingSetCallback(TrainerCallback):
         self.trainer = trainer
 
     def on_evaluate(self, args, state, control, **kwargs):
-        logger.info(f"======= Evaluating training subset =======")
+        logger.info("======= Evaluating training subset =======")
         output = self.trainer.predict(self.test_dataset, metric_key_prefix='train')
         self.trainer.log(output.metrics)

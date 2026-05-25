@@ -28,10 +28,10 @@ We also plan to release our datasets used for training/evaluation, which could b
 
 # Dev Setup
 
-In a pip or conda environment with python 3.12, run:
+This project uses [uv](https://docs.astral.sh/uv/) for dependency management. With uv installed, run:
 ```
-pip install -r requirements.txt
-python -m spacy download en_core_web_md
+uv sync
+uv run python -m spacy download en_core_web_md
 ```
 
 ## Incorporating new training data

@@ -8,7 +8,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 here = Path(__file__).parent
 
-DB_URL = f'postgresql+psycopg2://phoenix:@127.0.0.1:5432/phoenix'
+DB_URL = 'postgresql+psycopg2://phoenix:@127.0.0.1:5432/phoenix'
 TABLES = {'cases', 'documents', 'points', 'services', 'topics', 'versions'}
 VERSION = '2026-01-28'
 DUMP_DIR = here / f'../data/db_dumps/{VERSION}'

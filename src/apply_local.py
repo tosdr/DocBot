@@ -46,7 +46,7 @@ def run_ad_hoc(text_file_paths: list, device='mps', batch_size=16):
     # case_ids = list(sorted(list_case_models()))
     case_ids = [201]
 
-    logger.info(f"Loading spacy model")
+    logger.info("Loading spacy model")
     spacy_model = spacy.load('en_core_web_md', disable=['attribute_ruler', 'lemmatizer', 'ner'])
 
     texts: list[str] = []

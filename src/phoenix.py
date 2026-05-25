@@ -32,7 +32,7 @@ class Client:
             self.endpoint = os.environ['PHOENIX_API_URL']
             self.api_key = os.environ['PHOENIX_API_KEY']
         except KeyError:
-            raise EnvironmentError(f"Environment variables PHOENIX_API_URL and PHOENIX_API_KEY not set")
+            raise EnvironmentError("Environment variables PHOENIX_API_URL and PHOENIX_API_KEY not set")
 
     def _request(self, request_kwargs: dict):
         # Timeout for requests - handles SSL hangs that can occur during do_handshake()

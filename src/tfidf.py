@@ -14,7 +14,6 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 from sklearn.model_selection import StratifiedKFold
-from sklearn.naive_bayes import ComplementNB
 import spacy
 from textacy.representations.vectorizers import Vectorizer
 from textacy import extract

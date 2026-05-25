@@ -60,7 +60,7 @@ def get_sent_boundaries(doc_datasets: dict[int, pd.DataFrame]) -> dict[int, list
     try:
         return pickle.load(open(cache_loc, mode='rb'))
     except FileNotFoundError:
-        logger.info(f"Cached sentence boundaries not found")
+        logger.info("Cached sentence boundaries not found")
         unique_texts = dict()
         for doc_dataset in doc_datasets.values():
             for id_doc, text in zip(doc_dataset.id_doc, doc_dataset.text):
@@ -132,7 +132,7 @@ def finetune(
             logger.info(f"{len(train_idxs)} train instances, {len(test_idxs)} test instances")
             logger.info(f"{len(test_doc_df)} test doc instances")
             if log_wandb:
-                run = wandb.init(project=f'tosdr_cases', group=str(case_id),
+                run = wandb.init(project='tosdr_cases', group=str(case_id),
                                  config=dict(fold=fold_i, dataset_version=CLASSIFICATION_VERSION))
                 wandb.define_metric('doc/f1', summary='max')
                 wandb.define_metric('eval/f1_pos', summary='max')
@@ -397,9 +397,9 @@ def train_parallel(args, device, train_fold_kwargs, dataset_dict, doc_dataset_di
                 break
         if not found:
             if receives == 0:
-                logger.error(f"No messages found upon startup")
+                logger.error("No messages found upon startup")
             else:
-                logger.info(f"No messages found, exiting")
+                logger.info("No messages found, exiting")
             break
         else:
             receives += 1
