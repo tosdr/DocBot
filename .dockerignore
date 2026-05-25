@@ -1,5 +1,5 @@
 data
-!data/*.pkl
+!data/db_dumps/2026-01-28/*.pkl
 !data/models/tfidf_v1
 logs
 wandb

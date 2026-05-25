@@ -17,4 +17,7 @@ WORKDIR /
 COPY . /.
 
 # Using ENTRYPOINT allows us to pass args with `docker run`
-ENTRYPOINT ["python", "/src/sent_spans/train.py"]
+# ENTRYPOINT ["python", "/src/sent_spans/train.py"]
+
+# For now we'll manually start training, so just sleep here
+CMD ["sleep", "infinity"]

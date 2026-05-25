@@ -7,7 +7,7 @@ langdetect
 pandas==2.*
 peft
 pytest
-psycopg2
+psycopg2-binary
 scikit-learn==1.8.*
 seaborn
 spacy==3.*

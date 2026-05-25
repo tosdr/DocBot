@@ -21,7 +21,7 @@ import torch
 from tqdm import tqdm
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-from src import inference, phoenix, utils, apply_local
+from src import inference, phoenix, utils, apply_local, make_classification_datasets
 from src.inference import MODEL_VERSION
 
 """
@@ -37,9 +37,9 @@ logger = logging.getLogger(__name__)
 MODEL_S3_BUCKET = 'tosdr-training'
 AWS_REGION = 'us-east-1'
 BOTO_CONFIG = BotoConfig(
-    connect_timeout = 5,    # seconds for the initial connection
-    read_timeout = 60,      # seconds for reading data from an established connection
-    retries={"mode": "standard", "max_attempts": 10}, # 'standard' mode offers exponential backoff
+    connect_timeout = 30,    # seconds for the initial connection
+    read_timeout = 180,      # seconds for reading data from an established connection
+    retries={"mode": "standard", "max_attempts": 12}, # 'standard' mode offers exponential backoff
     region_name=AWS_REGION
 )
 
@@ -64,20 +64,23 @@ class DocStore:
         # Non-clean version to match the DB
         self.local_docs = pd.read_pickle(here / f'../data/db_dumps/{apply_local.LOCAL_DUMP_VERSION}/documents.pkl')
 
-        # Since we plan to use one machine we can just cache docs here. It we scale up to a big cluster we can have them
-        # share a cache.
+        # Since we plan to use one machine we can just keep docs in memory here. If we scale up to a big cluster we can
+        # have them share a cache.
         # Update: since fetching/prepping docs is the slowest step, and we're seeing intermittent crashes from API DNS
-        # failures, I'm adding a cache on disk so this is preserved across restarts.
-        self.cache_loc = here / '../data/docbot_doc_cache.pkl'
-        try:
-            self.docs = pickle.load(open(self.cache_loc, 'rb'))
-        except FileNotFoundError:
-            self.docs = dict()
+        # failures, I'm adding a cache on disk so this is preserved across restarts (non-local only)
+        self.docs = dict()
+        if not self.local_data:
+            self.cache_loc = here / '../data/docbot_doc_cache.pkl'
+            try:
+                self.docs = pickle.load(open(self.cache_loc, 'rb'))
+            except FileNotFoundError:
+                pass
 
     def __getitem__(self, doc_id):
         if doc_id not in self.docs:
             self.docs[doc_id] = self.fetch_doc(doc_id)
-            pickle.dump(self.docs, open(self.cache_loc, 'wb'))
+            if not self.local_data:
+                pickle.dump(self.docs, open(self.cache_loc, 'wb'))
         return self.docs[doc_id]
 
     def fetch_batch(self, doc_ids: list[int], batch_size: int = 5):
@@ -95,7 +98,8 @@ class DocStore:
                 self.docs[doc_id] = doc
 
         # Persist cache once after all fetches, not per doc
-        pickle.dump(self.docs, open(self.cache_loc, 'wb'))
+        if not self.local_data:
+            pickle.dump(self.docs, open(self.cache_loc, 'wb'))
         logger.debug(f"Prefetched and cached {len(to_fetch)} docs")
 
     def fetch_doc(self, doc_id):
@@ -160,19 +164,31 @@ def load_peft_model(case_id, base_model, local_models):
 
 def run_case(
         case_id: int, local_models: bool, local_data: bool, dont_post: bool,
-        doc_list: list[tuple[int, str]], doc_store, phoenix_client, threshold, batch_size, device,
-        tokenizer=None
+        doc_list: list[tuple[int, str]], doc_store, phoenix_client, threshold: float, batch_size: int, device: str,
+        skip_point_check: bool=False, tokenizer=None
 ):
-    if local_data:
-        local_points = pd.read_pickle(here / f'../data/db_dumps/{apply_local.LOCAL_DUMP_VERSION}/points.pkl')
-        points = local_points[local_points.case_id == case_id].copy()
+    """
+    :param local_models: If True loads PEFT adapters from `data/models/`, else pulls from S3
+    :param local_data: If True gets docs and points via local DB dumps, otherwise hits the phoenix API
+    :param dont_post: Don't POST results (new points and docbot records) to phoenix, just run locally
+    :param doc_list: (Doc ID, text version) tuples
+    :param threshold: Score threshold used to decide wheather a new pending point should be created
+    :param skip_point_check: Don't skip a case/doc pair if there is an existing point (used for local inference)
+    :return:
+    """
+    if not skip_point_check:
+        if local_data:
+            local_points = pd.read_pickle(here / f'../data/db_dumps/{apply_local.LOCAL_DUMP_VERSION}/points.pkl')
+            points = local_points[local_points.case_id == case_id].copy()
+        else:
+            points_list = phoenix_client.get_points_for_case(case_id)
+            # Turn list of dicts into a dataframe, to match the access pattern when local_data is True
+            points = pd.DataFrame(points_list)
+        logger.info(f"Found {len(points)} points")
+        # Points document_id is a float, we'll want to turn it into a int for comparison (ideally this should be done upstream)
+        points['document_id'] = points.document_id.apply(lambda doc_id: None if pd.isna(doc_id) else int(doc_id))
     else:
-        points_list = phoenix_client.get_points_for_case(case_id)
-        # Turn list of dicts into a dataframe, to match the access pattern when local_data is True
-        points = pd.DataFrame(points_list)
-    logger.info(f"Found {len(points)} points")
-    # Points document_id is a float, we'll want to turn it into a int for comparison (ideally this should be done earlier)
-    points['document_id'] = points.document_id.apply(lambda doc_id: None if pd.isna(doc_id) else int(doc_id))
+        assert dont_post, "Are you sure existing points should be ignored?"
 
     # Model loading
     prefilter_kwargs = inference.load_prefilter_kwargs(case_id)
@@ -254,23 +270,28 @@ def run_case(
 
                 # If doc has points of any status except for declined or draft (approved, pending, disputed, changes-requested)
                 # we don't need to apply the model
-                doc_points = points[points.document_id == doc_id]
-                skipable_statuses = set(doc_points.status.values) - {'declined', 'draft'}
-                if len(skipable_statuses) > 0:
-                    logger.debug(f"Skipping due to existing {skipable_statuses} points")
-                    # Don't mark visited because point statuses can change.
-                    # We could probably mark visited if there are approved points, but it's not a big deal to keep re-checking
-                    result_counts['skip_points'] += 1
-                    continue
+                if not skip_point_check:
+                    doc_points = points[points.document_id == doc_id]
+                    skipable_statuses = set(doc_points.status.values) - {'declined', 'draft'}
+                    if len(skipable_statuses) > 0:
+                        logger.debug(f"Skipping due to existing {skipable_statuses} points")
+                        # Don't mark visited because point statuses can change.
+                        # We could probably mark visited if there are approved points, but it's not a big deal to keep re-checking
+                        result_counts['skip_points'] += 1
+                        continue
 
-                # Mark declined points as offlimits, so those character spans don't get suggested again
-                #TODO if the document changes, the declined point spans will be incorrect. Really, we should add
-                # text_version to the Point schema and only invalidate if they are current.
-                declined_points = doc_points[doc_points.status == 'declined']
-                off_limits = [
-                    (point.quote_start, point.quote_end) for i, point in declined_points.iterrows()
-                    if not pd.isna(point.quote_start) and not pd.isna(point.quote_end)
-                ]
+                    # Mark declined points as offlimits, so those character spans don't get suggested again
+                    #TODO if the document changes, the declined point spans will be incorrect. Really, we should add
+                    # text_version to the Point schema and only invalidate if they are current.
+                    #TODO if a declined point was ever "quote not found", technically we shouldn't mark it offlimit here
+                    # This might only be possible to know using the `versions` table
+                    declined_points = doc_points[doc_points.status == 'declined']
+                    off_limits = [
+                        (point.quote_start, point.quote_end) for i, point in declined_points.iterrows()
+                        if not pd.isna(point.quote_start) and not pd.isna(point.quote_end)
+                    ]
+                else:
+                    off_limits = []
 
                 ret = inference.apply_sent_span_model(
                     doc['content'], doc['sent_boundaries'],
@@ -330,7 +351,15 @@ def run_case(
 def get_all_docs(local_data, phoenix_client) -> list[tuple[int, str]]:
     if local_data:
         # Non-clean version to match the DB
-        ids = pd.read_pickle(here / f'../data/db_dumps/{apply_local.LOCAL_DUMP_VERSION}/documents.pkl').id.values
+        # ids = pd.read_pickle(here / f'../data/db_dumps/{apply_local.LOCAL_DUMP_VERSION}/documents.pkl').id.values
+        # Instead of the full docs table from the DB dump, I'd like to use this script to find true negatives from the
+        # doc dataset.
+        doc_datasets: dict[int, pd.DataFrame] = make_classification_datasets.load_docs()
+        ids = set()
+        for case_id in doc_datasets:
+            negatives = doc_datasets[case_id][doc_datasets[case_id].label == 'negative']
+            ids |= set(negatives.id_doc)
+
         # There was no text_version in the older documents schema, so just pretend they're all '0'
         return [(i, '0') for i in ids]
     else:
@@ -362,7 +391,10 @@ def save_results(case_result_scores, case_result_counts, results_dir, s3_client,
                 ExtraArgs={'ContentType': 'application/x-binary'}
             )
 
-def run_all_cases(limit: int, local_models: bool, local_data: bool, dont_post: bool, batch_size: int, device: str):
+def run_all_cases(
+        limit: int, local_models: bool, local_data: bool, dont_post: bool, batch_size: int, device: str,
+        skip_point_check: bool=False
+):
     start_s = time.time()
     LOG_DIR.mkdir(exist_ok=True)
     logger.addHandler(logging.FileHandler(LOG_DIR / f'{int(start_s)}.log'))
@@ -412,7 +444,7 @@ def run_all_cases(limit: int, local_models: bool, local_data: bool, dont_post: b
         result_counts, result_scores, mean_prefilter_rate = run_case(
             case_id, local_models, local_data, dont_post,
             doc_list, doc_store, phoenix_client, inference.THRESHOLDS[case_id], batch_size, device,
-            tokenizer=tokenizer
+            tokenizer=tokenizer, skip_point_check=skip_point_check
         )
         for result, count in result_counts.items():
             total_result_counts[result] += count
@@ -430,7 +462,7 @@ def run_all_cases(limit: int, local_models: bool, local_data: bool, dont_post: b
         # Get new S3 credentials in case the 12 hour limit ran out
         if not dont_post or not local_models:
             s3_client = boto3.client('s3', **get_aws_creds(), config=BOTO_CONFIG)
-        save_results(case_result_scores, case_result_counts, results_dir, None if dont_post else s3_client, timestamp_key)
+    save_results(case_result_scores, case_result_counts, results_dir, None if dont_post else s3_client, timestamp_key)
 
     end_s = time.time()
     logger.info(f"Ending at {int(end_s)} for a duration of {end_s - start_s:.3f} seconds")
@@ -468,12 +500,18 @@ if __name__ == '__main__':
         help='Instead of POSTing new docbot history and new points to Phoenix, just print'
     )
     parser.add_argument(
+        '--skip_point_check', action='store_true',
+        help='Dont avoid running case/doc pairs that already have existing points (used for local inference)'
+    )
+    parser.add_argument(
         '--cuda_only', action='store_true',
         help='Only run if cuda hardware is available. Will still run on CUDA if not set, this just enforces it.'
     )
     parser.add_argument('--batch_size', type=int, default=16)
-    parser.set_defaults(local_models=False, local_data=False, dont_post=False, cuda_only=False)
+    parser.set_defaults(local_models=False, local_data=False, dont_post=False, cuda_only=False, skip_point_check=False)
     args = parser.parse_args()
 
     device = resolve_device(args)
-    run_all_cases(args.limit, args.local_models, args.local_data, args.dont_post, args.batch_size, device)
+    run_all_cases(
+        args.limit, args.local_models, args.local_data, args.dont_post, args.batch_size, device, args.skip_point_check
+    )

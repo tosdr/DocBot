@@ -19,7 +19,13 @@ logger = logging.getLogger(__name__)
 here = Path(__file__).parent
 
 DetectorFactory.seed = 0
-MAX_EXPANSION_SENTENCES = 5
+# Trigger langdetect initialization once in the main thread (helps when doing inference in parallel)
+try:
+    langdetect.detect("")
+except:
+    pass
+
+MAX_EXPANSION_SENTENCES = 3
 
 # Used for huggingface's from_pretrained()
 BASE_MODEL_NAME = 'bert-base-uncased'

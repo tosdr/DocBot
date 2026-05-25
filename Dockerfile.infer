@@ -1,12 +1,14 @@
 # syntax=docker/dockerfile:1
-#TODO upgrade to pytorch/pytorch:2.10.0-cuda12.8-cudnn9-runtime
-FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime as build
+#FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime as build
+FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-runtime
 
-#TODO python 3.12 upgrade
-RUN conda init bash && \
-    . ~/.bashrc && \
-    yes | conda create -n tosdr python=3.9 && \
-    conda activate tosdr
+ENV PYTHONUNBUFFERED=1
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+
+# The base image should already have python 3.12 installed, no need to do it here
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl unzip && \
+    rm -rf /var/lib/apt/lists/*
 
 COPY requirements-infer.txt /requirements-infer.txt
 
@@ -19,4 +21,7 @@ WORKDIR /
 COPY . /.
 
 # Using ENTRYPOINT allows us to pass args with `docker run`
-ENTRYPOINT ["python", "/src/apply_docbot.py"]
+# ENTRYPOINT ["python", "/src/apply_docbot.py"]
+
+# For now we'll manually start inference, so just sleep here
+CMD ["sleep", "infinity"]
