@@ -27,16 +27,16 @@ def temp_dirs(tmp_path):
     return log_dir, results_dir
 
 
-def make_doc(doc_id, lang='en', text='Sample document text for testing.', service_id=1, url='http://example.com'):
+def make_doc(doc_id, lang="en", text="Sample document text for testing.", service_id=1, url="http://example.com"):
     """Helper to create a document dict with required fields"""
     return {
-        'id': doc_id,
-        'text': text,
-        'content': text,  # In real code this is preprocessed, but for tests we use same text
-        'lang': lang,
-        'sent_boundaries': [0, len(text)],
-        'service_id': service_id,
-        'url': url,
+        "id": doc_id,
+        "text": text,
+        "content": text,  # In real code this is preprocessed, but for tests we use same text
+        "lang": lang,
+        "sent_boundaries": [0, len(text)],
+        "service_id": service_id,
+        "url": url,
     }
 
 
@@ -47,13 +47,7 @@ def make_empty_points_list():
     """
     # Return a list with a dummy point that will never match any doc_id
     # This ensures DataFrame has the right columns
-    return [{
-        'document_id': -999,
-        'status': 'declined',
-        'quote_start': 0,
-        'quote_end': 0,
-        'case_id': TEST_CASE_ID,
-    }]
+    return [{"document_id": -999, "status": "declined", "quote_start": 0, "quote_end": 0, "case_id": TEST_CASE_ID}]
 
 
 class TestRunCase:
@@ -69,20 +63,21 @@ class TestRunCase:
         from src import apply_docbot
 
         doc_id = 123
-        doc_list = [(doc_id, '1')]
+        doc_list = [(doc_id, "1")]
         doc = make_doc(doc_id)
         threshold = 0.5
 
         # High score - should be found
         inference_return = (0.95, 10, 50, 2, 0.5)
 
-        with patch('src.apply_docbot.inference.apply_sent_span_model', return_value=inference_return), \
-             patch('src.apply_docbot.inference.load_prefilter_kwargs', return_value={}), \
-             patch('src.apply_docbot.inference.test_gpu_memory'), \
-             patch('src.apply_docbot.load_peft_model') as mock_peft, \
-             patch('src.apply_docbot.AutoModelForSequenceClassification.from_pretrained') as mock_auto, \
-             patch('src.apply_docbot.AutoTokenizer.from_pretrained'):
-
+        with (
+            patch("src.apply_docbot.inference.apply_sent_span_model", return_value=inference_return),
+            patch("src.apply_docbot.inference.load_prefilter_kwargs", return_value={}),
+            patch("src.apply_docbot.inference.test_gpu_memory"),
+            patch("src.apply_docbot.load_peft_model") as mock_peft,
+            patch("src.apply_docbot.AutoModelForSequenceClassification.from_pretrained") as mock_auto,
+            patch("src.apply_docbot.AutoTokenizer.from_pretrained"),
+        ):
             # Set up model mock
             mock_model = Mock()
             mock_model.to = Mock(return_value=mock_model)
@@ -108,11 +103,11 @@ class TestRunCase:
                 phoenix_client=mock_client,
                 threshold=threshold,
                 batch_size=1,
-                device='cpu'
+                device="cpu",
             )
 
-        assert result_counts['ran_found'] == 1
-        assert result_counts.get('ran_notfound', 0) == 0
+        assert result_counts["ran_found"] == 1
+        assert result_counts.get("ran_notfound", 0) == 0
         assert doc_id in result_scores
         assert result_scores[doc_id] == 0.95
 
@@ -126,20 +121,21 @@ class TestRunCase:
         from src import apply_docbot
 
         doc_id = 456
-        doc_list = [(doc_id, '1')]
+        doc_list = [(doc_id, "1")]
         doc = make_doc(doc_id)
         threshold = 0.5
 
         # Low score - should not be found
         inference_return = (0.3, 10, 50, 2, 0.5)
 
-        with patch('src.apply_docbot.inference.apply_sent_span_model', return_value=inference_return), \
-             patch('src.apply_docbot.inference.load_prefilter_kwargs', return_value={}), \
-             patch('src.apply_docbot.inference.test_gpu_memory'), \
-             patch('src.apply_docbot.load_peft_model') as mock_peft, \
-             patch('src.apply_docbot.AutoModelForSequenceClassification.from_pretrained') as mock_auto, \
-             patch('src.apply_docbot.AutoTokenizer.from_pretrained'):
-
+        with (
+            patch("src.apply_docbot.inference.apply_sent_span_model", return_value=inference_return),
+            patch("src.apply_docbot.inference.load_prefilter_kwargs", return_value={}),
+            patch("src.apply_docbot.inference.test_gpu_memory"),
+            patch("src.apply_docbot.load_peft_model") as mock_peft,
+            patch("src.apply_docbot.AutoModelForSequenceClassification.from_pretrained") as mock_auto,
+            patch("src.apply_docbot.AutoTokenizer.from_pretrained"),
+        ):
             mock_model = Mock()
             mock_model.to = Mock(return_value=mock_model)
             mock_peft.return_value = mock_model
@@ -162,11 +158,11 @@ class TestRunCase:
                 phoenix_client=mock_client,
                 threshold=threshold,
                 batch_size=1,
-                device='cpu'
+                device="cpu",
             )
 
-        assert result_counts.get('ran_found', 0) == 0
-        assert result_counts['ran_notfound'] == 1
+        assert result_counts.get("ran_found", 0) == 0
+        assert result_counts["ran_notfound"] == 1
         assert doc_id in result_scores
         assert result_scores[doc_id] == 0.3
 
@@ -180,17 +176,18 @@ class TestRunCase:
         from src import apply_docbot
 
         doc_id = 789
-        doc_list = [(doc_id, '1')]
-        doc = make_doc(doc_id, lang='fr')  # French document
+        doc_list = [(doc_id, "1")]
+        doc = make_doc(doc_id, lang="fr")  # French document
         threshold = 0.5
 
-        with patch('src.apply_docbot.inference.apply_sent_span_model') as mock_inference, \
-             patch('src.apply_docbot.inference.load_prefilter_kwargs', return_value={}), \
-             patch('src.apply_docbot.inference.test_gpu_memory'), \
-             patch('src.apply_docbot.load_peft_model') as mock_peft, \
-             patch('src.apply_docbot.AutoModelForSequenceClassification.from_pretrained') as mock_auto, \
-             patch('src.apply_docbot.AutoTokenizer.from_pretrained'):
-
+        with (
+            patch("src.apply_docbot.inference.apply_sent_span_model") as mock_inference,
+            patch("src.apply_docbot.inference.load_prefilter_kwargs", return_value={}),
+            patch("src.apply_docbot.inference.test_gpu_memory"),
+            patch("src.apply_docbot.load_peft_model") as mock_peft,
+            patch("src.apply_docbot.AutoModelForSequenceClassification.from_pretrained") as mock_auto,
+            patch("src.apply_docbot.AutoTokenizer.from_pretrained"),
+        ):
             mock_model = Mock()
             mock_model.to = Mock(return_value=mock_model)
             mock_peft.return_value = mock_model
@@ -213,12 +210,12 @@ class TestRunCase:
                 phoenix_client=mock_client,
                 threshold=threshold,
                 batch_size=1,
-                device='cpu'
+                device="cpu",
             )
 
-        assert result_counts['skip_non_en'] == 1
-        assert result_counts.get('ran_found', 0) == 0
-        assert result_counts.get('ran_notfound', 0) == 0
+        assert result_counts["skip_non_en"] == 1
+        assert result_counts.get("ran_found", 0) == 0
+        assert result_counts.get("ran_notfound", 0) == 0
         # Verify inference was not called
         mock_inference.assert_not_called()
 
@@ -232,28 +229,29 @@ class TestRunCase:
         from src import apply_docbot
 
         doc_id = 321
-        doc_list = [(doc_id, '1')]
+        doc_list = [(doc_id, "1")]
         doc = make_doc(doc_id)
         threshold = 0.5
 
         # Points with approved status for this doc
         points_data = [
             {
-                'document_id': int(doc_id),
-                'status': 'approved',
-                'quote_start': 0,
-                'quote_end': 10,
-                'case_id': TEST_CASE_ID,
+                "document_id": int(doc_id),
+                "status": "approved",
+                "quote_start": 0,
+                "quote_end": 10,
+                "case_id": TEST_CASE_ID,
             }
         ]
 
-        with patch('src.apply_docbot.inference.apply_sent_span_model') as mock_inference, \
-             patch('src.apply_docbot.inference.load_prefilter_kwargs', return_value={}), \
-             patch('src.apply_docbot.inference.test_gpu_memory'), \
-             patch('src.apply_docbot.load_peft_model') as mock_peft, \
-             patch('src.apply_docbot.AutoModelForSequenceClassification.from_pretrained') as mock_auto, \
-             patch('src.apply_docbot.AutoTokenizer.from_pretrained'):
-
+        with (
+            patch("src.apply_docbot.inference.apply_sent_span_model") as mock_inference,
+            patch("src.apply_docbot.inference.load_prefilter_kwargs", return_value={}),
+            patch("src.apply_docbot.inference.test_gpu_memory"),
+            patch("src.apply_docbot.load_peft_model") as mock_peft,
+            patch("src.apply_docbot.AutoModelForSequenceClassification.from_pretrained") as mock_auto,
+            patch("src.apply_docbot.AutoTokenizer.from_pretrained"),
+        ):
             mock_model = Mock()
             mock_model.to = Mock(return_value=mock_model)
             mock_peft.return_value = mock_model
@@ -276,12 +274,12 @@ class TestRunCase:
                 phoenix_client=mock_client,
                 threshold=threshold,
                 batch_size=1,
-                device='cpu'
+                device="cpu",
             )
 
-        assert result_counts['skip_points'] == 1
-        assert result_counts.get('ran_found', 0) == 0
-        assert result_counts.get('ran_notfound', 0) == 0
+        assert result_counts["skip_points"] == 1
+        assert result_counts.get("ran_found", 0) == 0
+        assert result_counts.get("ran_notfound", 0) == 0
         # Verify inference was not called
         mock_inference.assert_not_called()
 
@@ -295,14 +293,14 @@ class TestRunCase:
         """
         from src import apply_docbot
 
-        doc1_id = '100'
-        doc2_id = '200'
-        doc3_id = '300'
-        doc_list = [(doc1_id, '1'), (doc2_id, '1'), (doc3_id, '1')]
+        doc1_id = "100"
+        doc2_id = "200"
+        doc3_id = "300"
+        doc_list = [(doc1_id, "1"), (doc2_id, "1"), (doc3_id, "1")]
 
-        doc1 = make_doc(doc1_id, lang='en')
-        doc2 = make_doc(doc2_id, lang='en')
-        doc3 = make_doc(doc3_id, lang='fr')  # French
+        doc1 = make_doc(doc1_id, lang="en")
+        doc2 = make_doc(doc2_id, lang="en")
+        doc3 = make_doc(doc3_id, lang="fr")  # French
 
         docs = {doc1_id: doc1, doc2_id: doc2, doc3_id: doc3}
         threshold = 0.5
@@ -310,7 +308,9 @@ class TestRunCase:
         # Track which doc inference is called with, return different scores
         inference_calls = []
 
-        def inference_side_effect(text, sent_boundaries, prefilter_kwargs, tokenizer, model, batch_size, device, off_limits):
+        def inference_side_effect(
+            text, sent_boundaries, prefilter_kwargs, tokenizer, model, batch_size, device, off_limits
+        ):
             # Determine which doc based on the call order
             call_num = len(inference_calls)
             inference_calls.append(call_num)
@@ -322,13 +322,16 @@ class TestRunCase:
                 # Doc 2: low score
                 return (0.3, 10, 50, 2, 0.5)
 
-        with patch('src.apply_docbot.inference.apply_sent_span_model', side_effect=inference_side_effect) as mock_inference, \
-             patch('src.apply_docbot.inference.load_prefilter_kwargs', return_value={}), \
-             patch('src.apply_docbot.inference.test_gpu_memory'), \
-             patch('src.apply_docbot.load_peft_model') as mock_peft, \
-             patch('src.apply_docbot.AutoModelForSequenceClassification.from_pretrained') as mock_auto, \
-             patch('src.apply_docbot.AutoTokenizer.from_pretrained'):
-
+        with (
+            patch(
+                "src.apply_docbot.inference.apply_sent_span_model", side_effect=inference_side_effect
+            ) as mock_inference,
+            patch("src.apply_docbot.inference.load_prefilter_kwargs", return_value={}),
+            patch("src.apply_docbot.inference.test_gpu_memory"),
+            patch("src.apply_docbot.load_peft_model") as mock_peft,
+            patch("src.apply_docbot.AutoModelForSequenceClassification.from_pretrained") as mock_auto,
+            patch("src.apply_docbot.AutoTokenizer.from_pretrained"),
+        ):
             mock_model = Mock()
             mock_model.to = Mock(return_value=mock_model)
             mock_peft.return_value = mock_model
@@ -351,13 +354,13 @@ class TestRunCase:
                 phoenix_client=mock_client,
                 threshold=threshold,
                 batch_size=1,
-                device='cpu'
+                device="cpu",
             )
 
         # Verify counts
-        assert result_counts['ran_found'] == 1
-        assert result_counts['ran_notfound'] == 1
-        assert result_counts['skip_non_en'] == 1
+        assert result_counts["ran_found"] == 1
+        assert result_counts["ran_notfound"] == 1
+        assert result_counts["skip_non_en"] == 1
 
         # Verify scores
         assert doc1_id in result_scores

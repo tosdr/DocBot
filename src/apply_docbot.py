@@ -34,13 +34,13 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 # logging.getLogger('src').setLevel(logging.DEBUG)
 
-MODEL_S3_BUCKET = 'tosdr-training'
-AWS_REGION = 'us-east-1'
+MODEL_S3_BUCKET = "tosdr-training"
+AWS_REGION = "us-east-1"
 BOTO_CONFIG = BotoConfig(
-    connect_timeout = 30,    # seconds for the initial connection
-    read_timeout = 180,      # seconds for reading data from an established connection
-    retries={"mode": "standard", "max_attempts": 12}, # 'standard' mode offers exponential backoff
-    region_name=AWS_REGION
+    connect_timeout=30,  # seconds for the initial connection
+    read_timeout=180,  # seconds for reading data from an established connection
+    retries={"mode": "standard", "max_attempts": 12},  # 'standard' mode offers exponential backoff
+    region_name=AWS_REGION,
 )
 
 DOCBOT_USER_ID = 21032
@@ -48,21 +48,23 @@ DOCBOT_USER_ID = 21032
 # Batch size for flushing docbot records to API
 DOCBOT_RECORD_BATCH_SIZE = 50
 
-LOG_DIR = here / '../logs'
+LOG_DIR = here / "../logs"
+
+
 def get_results_dir(timestamp):
-    return here / f'../data/results/{timestamp}'
+    return here / f"../data/results/{timestamp}"
 
 
 class DocStore:
     def __init__(self, local_data: bool, phoenix_client):
         logger.info("Loading spacy model")
         # Minimal pipeline for sentence splitting
-        self.spacy_model = spacy.load('en_core_web_md', disable=['attribute_ruler', 'lemmatizer', 'ner'])
+        self.spacy_model = spacy.load("en_core_web_md", disable=["attribute_ruler", "lemmatizer", "ner"])
 
         self.local_data = local_data
         self.phoenix_client = phoenix_client
         # Non-clean version to match the DB
-        self.local_docs = pd.read_pickle(here / f'../data/db_dumps/{apply_local.LOCAL_DUMP_VERSION}/documents.pkl')
+        self.local_docs = pd.read_pickle(here / f"../data/db_dumps/{apply_local.LOCAL_DUMP_VERSION}/documents.pkl")
 
         # Since we plan to use one machine we can just keep docs in memory here. If we scale up to a big cluster we can
         # have them share a cache.
@@ -70,9 +72,9 @@ class DocStore:
         # failures, I'm adding a cache on disk so this is preserved across restarts (non-local only)
         self.docs = dict()
         if not self.local_data:
-            self.cache_loc = here / '../data/docbot_doc_cache.pkl'
+            self.cache_loc = here / "../data/docbot_doc_cache.pkl"
             try:
-                self.docs = pickle.load(open(self.cache_loc, 'rb'))
+                self.docs = pickle.load(open(self.cache_loc, "rb"))
             except FileNotFoundError:
                 pass
 
@@ -80,7 +82,7 @@ class DocStore:
         if doc_id not in self.docs:
             self.docs[doc_id] = self.fetch_doc(doc_id)
             if not self.local_data:
-                pickle.dump(self.docs, open(self.cache_loc, 'wb'))
+                pickle.dump(self.docs, open(self.cache_loc, "wb"))
         return self.docs[doc_id]
 
     def fetch_batch(self, doc_ids: list[int], batch_size: int = 5):
@@ -91,7 +93,7 @@ class DocStore:
 
         logger.debug(f"Prefetching {len(to_fetch)} docs in batches of {batch_size}")
         for i in range(0, len(to_fetch), batch_size):
-            batch = to_fetch[i:i + batch_size]
+            batch = to_fetch[i : i + batch_size]
             with ThreadPoolExecutor(max_workers=batch_size) as executor:
                 results = list(executor.map(self.fetch_doc, batch))
             for doc_id, doc in zip(batch, results):
@@ -99,7 +101,7 @@ class DocStore:
 
         # Persist cache once after all fetches, not per doc
         if not self.local_data:
-            pickle.dump(self.docs, open(self.cache_loc, 'wb'))
+            pickle.dump(self.docs, open(self.cache_loc, "wb"))
         logger.debug(f"Prefetched and cached {len(to_fetch)} docs")
 
     def fetch_doc(self, doc_id):
@@ -109,17 +111,17 @@ class DocStore:
             doc = self.phoenix_client.get_doc(int(doc_id))
 
         # Precompute language, HTML-free content, and sentence boundaries
-        if doc is not None and doc['text'] is not None:
-            content = utils.preprocess_doc_text(doc['text'])
-            doc['content'] = content
-            doc['lang'] = inference.detect_lang(content)
+        if doc is not None and doc["text"] is not None:
+            content = utils.preprocess_doc_text(doc["text"])
+            doc["content"] = content
+            doc["lang"] = inference.detect_lang(content)
 
-            if doc['lang'] == 'en':
+            if doc["lang"] == "en":
                 # Spacy has a default limit of 1mil characters. This can be increased, but probably safest to have a ceiling
                 spacy_doc = self.spacy_model(content[:1000000])
-                sents = list(filter(lambda sent: sent.text != '' and not sent.text.isspace(), spacy_doc.sents))
+                sents = list(filter(lambda sent: sent.text != "" and not sent.text.isspace(), spacy_doc.sents))
                 sent_boundaries = list(sorted(map(lambda s: s.start_char, sents)))
-                doc['sent_boundaries'] = sent_boundaries
+                doc["sent_boundaries"] = sent_boundaries
 
         return doc
 
@@ -127,20 +129,22 @@ class DocStore:
 @contextmanager
 def s3_fileobj(bucket, key, s3_client):
     obj = s3_client.get_object(Bucket=bucket, Key=key)
-    yield BytesIO(obj['Body'].read())
+    yield BytesIO(obj["Body"].read())
+
 
 def get_aws_creds() -> dict[str, str]:
-    client = boto3.client('sts')
+    client = boto3.client("sts")
     response = client.assume_role(
-        RoleArn=os.environ['AWS_ROLE'],
-        RoleSessionName=f'docbot-infer-{int(time.time())}',
-        DurationSeconds=43200   # 12 hour max
+        RoleArn=os.environ["AWS_ROLE"],
+        RoleSessionName=f"docbot-infer-{int(time.time())}",
+        DurationSeconds=43200,  # 12 hour max
     )
     return {
-        'aws_access_key_id': response['Credentials']['AccessKeyId'],
-        'aws_secret_access_key': response['Credentials']['SecretAccessKey'],
-        'aws_session_token': response['Credentials']['SessionToken']
+        "aws_access_key_id": response["Credentials"]["AccessKeyId"],
+        "aws_secret_access_key": response["Credentials"]["SecretAccessKey"],
+        "aws_session_token": response["Credentials"]["SessionToken"],
     }
+
 
 def load_peft_model(case_id, base_model, local_models):
     if local_models:
@@ -148,13 +152,13 @@ def load_peft_model(case_id, base_model, local_models):
         logger.info(f"Initializing PEFT adapter from {peft_model_loc}")
     else:
         # Each case could take a long time, so get new IAM Role credentials to be safe (12 hour limit)
-        s3_client = boto3.client('s3', **get_aws_creds(), config=BOTO_CONFIG)
+        s3_client = boto3.client("s3", **get_aws_creds(), config=BOTO_CONFIG)
 
         tmpdir = tempfile.TemporaryDirectory()
         logger.info(f"Pulling PEFT adapter from: s3://{MODEL_S3_BUCKET}/{MODEL_VERSION}/{case_id}/adapter_model.bin")
-        for filename in ['adapter_model.bin', 'adapter_config.json']:
-            with s3_fileobj(MODEL_S3_BUCKET, f'{MODEL_VERSION}/{case_id}/{filename}', s3_client) as f:
-                with open(f'{tmpdir.name}/{filename}', 'wb') as to_file:
+        for filename in ["adapter_model.bin", "adapter_config.json"]:
+            with s3_fileobj(MODEL_S3_BUCKET, f"{MODEL_VERSION}/{case_id}/{filename}", s3_client) as f:
+                with open(f"{tmpdir.name}/{filename}", "wb") as to_file:
                     to_file.write(f.read())
         peft_model_loc = tmpdir.name
 
@@ -162,10 +166,20 @@ def load_peft_model(case_id, base_model, local_models):
     # https://github.com/huggingface/peft/issues/217#issuecomment-1506224612
     return model.merge_and_unload()
 
+
 def run_case(
-        case_id: int, local_models: bool, local_data: bool, dont_post: bool,
-        doc_list: list[tuple[int, str]], doc_store, phoenix_client, threshold: float, batch_size: int, device: str,
-        skip_point_check: bool=False, tokenizer=None
+    case_id: int,
+    local_models: bool,
+    local_data: bool,
+    dont_post: bool,
+    doc_list: list[tuple[int, str]],
+    doc_store,
+    phoenix_client,
+    threshold: float,
+    batch_size: int,
+    device: str,
+    skip_point_check: bool = False,
+    tokenizer=None,
 ):
     """
     :param local_models: If True loads PEFT adapters from `data/models/`, else pulls from S3
@@ -178,7 +192,7 @@ def run_case(
     """
     if not skip_point_check:
         if local_data:
-            local_points = pd.read_pickle(here / f'../data/db_dumps/{apply_local.LOCAL_DUMP_VERSION}/points.pkl')
+            local_points = pd.read_pickle(here / f"../data/db_dumps/{apply_local.LOCAL_DUMP_VERSION}/points.pkl")
             points = local_points[local_points.case_id == case_id].copy()
         else:
             points_list = phoenix_client.get_points_for_case(case_id)
@@ -186,7 +200,7 @@ def run_case(
             points = pd.DataFrame(points_list)
         logger.info(f"Found {len(points)} points")
         # Points document_id is a float, we'll want to turn it into a int for comparison (ideally this should be done upstream)
-        points['document_id'] = points.document_id.apply(lambda doc_id: None if pd.isna(doc_id) else int(doc_id))
+        points["document_id"] = points.document_id.apply(lambda doc_id: None if pd.isna(doc_id) else int(doc_id))
     else:
         assert dont_post, "Are you sure existing points should be ignored?"
 
@@ -240,70 +254,89 @@ def run_case(
 
                 if (doc_id, text_version) in visited_docs:
                     logger.debug(f"Skipping {doc_id, text_version}")
-                    result_counts['skip_visited'] += 1
+                    result_counts["skip_visited"] += 1
                     continue
 
                 doc = doc_store[doc_id]
                 if doc is None:
                     # Edge case that should only come up when the original GET all doc IDs call returns some ID that can no
                     # longer be retrieved from phoenix. Don't mark it as visited.
-                    result_counts['skip_notfound'] += 1
+                    result_counts["skip_notfound"] += 1
                     continue
 
-                if 'text' not in doc or doc['text'] is None or doc['content'].strip() == '':
-                    result_counts['skip_empty'] += 1
+                if "text" not in doc or doc["text"] is None or doc["content"].strip() == "":
+                    result_counts["skip_empty"] += 1
                     # Mark as visited
-                    docbot_records_pending.append({
-                        'case_id': case_id, 'document_id': doc_id, 'text_version': text_version,
-                        'docbot_version': MODEL_VERSION
-                    })
+                    docbot_records_pending.append(
+                        {
+                            "case_id": case_id,
+                            "document_id": doc_id,
+                            "text_version": text_version,
+                            "docbot_version": MODEL_VERSION,
+                        }
+                    )
                     continue
 
-                if doc['lang'] != 'en':
-                    result_counts['skip_non_en'] += 1
+                if doc["lang"] != "en":
+                    result_counts["skip_non_en"] += 1
                     # If the doc is not english, mark visited so we don't re-consider it next time
-                    docbot_records_pending.append({
-                        'case_id': case_id, 'document_id': doc_id, 'text_version': text_version,
-                        'docbot_version': MODEL_VERSION
-                    })
+                    docbot_records_pending.append(
+                        {
+                            "case_id": case_id,
+                            "document_id": doc_id,
+                            "text_version": text_version,
+                            "docbot_version": MODEL_VERSION,
+                        }
+                    )
                     continue
 
                 # If doc has points of any status except for declined or draft (approved, pending, disputed, changes-requested)
                 # we don't need to apply the model
                 if not skip_point_check:
                     doc_points = points[points.document_id == doc_id]
-                    skipable_statuses = set(doc_points.status.values) - {'declined', 'draft'}
+                    skipable_statuses = set(doc_points.status.values) - {"declined", "draft"}
                     if len(skipable_statuses) > 0:
                         logger.debug(f"Skipping due to existing {skipable_statuses} points")
                         # Don't mark visited because point statuses can change.
                         # We could probably mark visited if there are approved points, but it's not a big deal to keep re-checking
-                        result_counts['skip_points'] += 1
+                        result_counts["skip_points"] += 1
                         continue
 
                     # Mark declined points as offlimits, so those character spans don't get suggested again
-                    #TODO if the document changes, the declined point spans will be incorrect. Really, we should add
+                    # TODO if the document changes, the declined point spans will be incorrect. Really, we should add
                     # text_version to the Point schema and only invalidate if they are current.
-                    #TODO if a declined point was ever "quote not found", technically we shouldn't mark it offlimit here
+                    # TODO if a declined point was ever "quote not found", technically we shouldn't mark it offlimit here
                     # This might only be possible to know using the `versions` table
-                    declined_points = doc_points[doc_points.status == 'declined']
+                    declined_points = doc_points[doc_points.status == "declined"]
                     off_limits = [
-                        (point.quote_start, point.quote_end) for i, point in declined_points.iterrows()
+                        (point.quote_start, point.quote_end)
+                        for i, point in declined_points.iterrows()
                         if not pd.isna(point.quote_start) and not pd.isna(point.quote_end)
                     ]
                 else:
                     off_limits = []
 
                 ret = inference.apply_sent_span_model(
-                    doc['content'], doc['sent_boundaries'],
-                    prefilter_kwargs, tokenizer, model, batch_size, device, off_limits
+                    doc["content"],
+                    doc["sent_boundaries"],
+                    prefilter_kwargs,
+                    tokenizer,
+                    model,
+                    batch_size,
+                    device,
+                    off_limits,
                 )
                 if ret is None:
                     # Edge case: if the entire document is off limits, there's nothing to return
-                    result_counts['ran_notfound'] += 1
-                    docbot_records_pending.append({
-                        'case_id': case_id, 'document_id': doc_id, 'text_version': text_version,
-                        'docbot_version': MODEL_VERSION
-                    })
+                    result_counts["ran_notfound"] += 1
+                    docbot_records_pending.append(
+                        {
+                            "case_id": case_id,
+                            "document_id": doc_id,
+                            "text_version": text_version,
+                            "docbot_version": MODEL_VERSION,
+                        }
+                    )
                 else:
                     score, best_start, best_end, _, filter_rate = ret
                     prefilter_rates.append(filter_rate)
@@ -315,25 +348,45 @@ def run_case(
 
                     success = score >= threshold
                     if success:
-                        logger.info(f"\n✅ Doc {doc_id} scored {score:.3f} with span:\n{doc['content'][best_start:best_end]}")
-                    result_counts['ran_found' if success else 'ran_notfound'] += 1
+                        logger.info(
+                            f"\n✅ Doc {doc_id} scored {score:.3f} with span:\n{doc['content'][best_start:best_end]}"
+                        )
+                    result_counts["ran_found" if success else "ran_notfound"] += 1
                     result_scores[doc_id] = {
-                        'score': score, 'best_start': best_start, 'best_end': best_end, 'filter_rate': filter_rate,
+                        "score": score,
+                        "best_start": best_start,
+                        "best_end": best_end,
+                        "filter_rate": filter_rate,
                     }
 
                     if not dont_post:
                         # Submit a quote using the original text (with HTML) as opposed to doc['content']
                         if success:
-                            analysis = f'Created by Docbot version {MODEL_VERSION}'
+                            analysis = f"Created by Docbot version {MODEL_VERSION}"
                             phoenix_client.add_point(
-                                case_id, DOCBOT_USER_ID, doc_id, doc['service_id'], doc['url'], analysis,
-                                doc['text'][best_start:best_end], best_start, best_end, MODEL_VERSION, score
+                                case_id,
+                                DOCBOT_USER_ID,
+                                doc_id,
+                                doc["service_id"],
+                                doc["url"],
+                                analysis,
+                                doc["text"][best_start:best_end],
+                                best_start,
+                                best_end,
+                                MODEL_VERSION,
+                                score,
                             )
-                    docbot_records_pending.append({
-                        'case_id': case_id, 'document_id': doc_id, 'text_version': text_version,
-                        'docbot_version': MODEL_VERSION, 'char_start': best_start, 'char_end': best_end,
-                        'ml_score': score
-                    })
+                    docbot_records_pending.append(
+                        {
+                            "case_id": case_id,
+                            "document_id": doc_id,
+                            "text_version": text_version,
+                            "docbot_version": MODEL_VERSION,
+                            "char_start": best_start,
+                            "char_end": best_end,
+                            "ml_score": score,
+                        }
+                    )
 
                 # Periodic flush to ensure progress is saved
                 if len(docbot_records_pending) >= DOCBOT_RECORD_BATCH_SIZE:
@@ -346,7 +399,12 @@ def run_case(
     # Final flush after loop completes
     flush_docbot_records()
 
-    return result_counts, result_scores, sum(prefilter_rates) / len(prefilter_rates) if len(prefilter_rates) > 0 else 0.
+    return (
+        result_counts,
+        result_scores,
+        sum(prefilter_rates) / len(prefilter_rates) if len(prefilter_rates) > 0 else 0.0,
+    )
+
 
 def get_all_docs(local_data, phoenix_client) -> list[tuple[int, str]]:
     if local_data:
@@ -357,53 +415,58 @@ def get_all_docs(local_data, phoenix_client) -> list[tuple[int, str]]:
         doc_datasets: dict[int, pd.DataFrame] = make_classification_datasets.load_docs()
         ids = set()
         for case_id in doc_datasets:
-            negatives = doc_datasets[case_id][doc_datasets[case_id].label == 'negative']
+            negatives = doc_datasets[case_id][doc_datasets[case_id].label == "negative"]
             ids |= set(negatives.id_doc)
 
         # There was no text_version in the older documents schema, so just pretend they're all '0'
-        return [(i, '0') for i in ids]
+        return [(i, "0") for i in ids]
     else:
         return phoenix_client.get_docs()
 
+
 def list_case_models_s3(s3_client) -> list[int]:
     case_ids = set()
-    list_result = s3_client.list_objects(Bucket=MODEL_S3_BUCKET, Prefix=f'{MODEL_VERSION}/')
-    for object_key in map(operator.itemgetter('Key'), list_result['Contents']):
-        match = re.match(rf'^{MODEL_VERSION}/(\d+)/adapter_model.bin', object_key)
+    list_result = s3_client.list_objects(Bucket=MODEL_S3_BUCKET, Prefix=f"{MODEL_VERSION}/")
+    for object_key in map(operator.itemgetter("Key"), list_result["Contents"]):
+        match = re.match(rf"^{MODEL_VERSION}/(\d+)/adapter_model.bin", object_key)
         if match is not None:
             case_ids.add(int(match.groups()[0]))
     return list(sorted(case_ids))
 
+
 def save_results(case_result_scores, case_result_counts, results_dir, s3_client, timestamp):
-    for obj, name in [(case_result_scores, 'result_scores'), (case_result_counts, 'result_counts')]:
+    for obj, name in [(case_result_scores, "result_scores"), (case_result_counts, "result_counts")]:
         # Save locally
-        pickle.dump(obj, open(results_dir / f'{name}.pkl', 'wb'))
+        pickle.dump(obj, open(results_dir / f"{name}.pkl", "wb"))
 
         # Save to s3, optionally
         if s3_client is not None:
             buffer = BytesIO()
             pickle.dump(obj, buffer)
             buffer.seek(0)
-            s3_key = f'infer/{timestamp}/{name}.pkl'
+            s3_key = f"infer/{timestamp}/{name}.pkl"
             logger.info(f"Uploading to s3://{MODEL_S3_BUCKET}/{s3_key}")
-            s3_client.upload_fileobj(
-                buffer, MODEL_S3_BUCKET, s3_key,
-                ExtraArgs={'ContentType': 'application/x-binary'}
-            )
+            s3_client.upload_fileobj(buffer, MODEL_S3_BUCKET, s3_key, ExtraArgs={"ContentType": "application/x-binary"})
+
 
 def run_all_cases(
-        limit: int, local_models: bool, local_data: bool, dont_post: bool, batch_size: int, device: str,
-        skip_point_check: bool=False
+    limit: int,
+    local_models: bool,
+    local_data: bool,
+    dont_post: bool,
+    batch_size: int,
+    device: str,
+    skip_point_check: bool = False,
 ):
     start_s = time.time()
     LOG_DIR.mkdir(exist_ok=True)
-    logger.addHandler(logging.FileHandler(LOG_DIR / f'{int(start_s)}.log'))
+    logger.addHandler(logging.FileHandler(LOG_DIR / f"{int(start_s)}.log"))
     logger.info(f"Starting at {int(start_s)}")
 
     phoenix_client = None if (local_data and dont_post) else phoenix.Client()
 
     if not dont_post or not local_models:
-        s3_client = boto3.client('s3', **get_aws_creds(), config=BOTO_CONFIG)
+        s3_client = boto3.client("s3", **get_aws_creds(), config=BOTO_CONFIG)
 
     # Load a list of case IDs
     if local_models:
@@ -442,9 +505,18 @@ def run_all_cases(
         case_start_s = time.time()
 
         result_counts, result_scores, mean_prefilter_rate = run_case(
-            case_id, local_models, local_data, dont_post,
-            doc_list, doc_store, phoenix_client, inference.THRESHOLDS[case_id], batch_size, device,
-            tokenizer=tokenizer, skip_point_check=skip_point_check
+            case_id,
+            local_models,
+            local_data,
+            dont_post,
+            doc_list,
+            doc_store,
+            phoenix_client,
+            inference.THRESHOLDS[case_id],
+            batch_size,
+            device,
+            tokenizer=tokenizer,
+            skip_point_check=skip_point_check,
         )
         for result, count in result_counts.items():
             total_result_counts[result] += count
@@ -455,13 +527,13 @@ def run_all_cases(
         logger.info(f"Mean filter rate for TF-IDF prefilter: {100 * mean_prefilter_rate:.2f}%")
         logger.info(f"Results:\n\t{dict(result_counts)}")
         if len(result_scores) > 0:
-            pred_scores = [d['score'] for d in result_scores.values()]
+            pred_scores = [d["score"] for d in result_scores.values()]
             logger.info(f"Prediction scores:\n{pd.Series(pred_scores).describe()}")
 
         # Serialize latest results in case of crash
         # Get new S3 credentials in case the 12 hour limit ran out
         if not dont_post or not local_models:
-            s3_client = boto3.client('s3', **get_aws_creds(), config=BOTO_CONFIG)
+            s3_client = boto3.client("s3", **get_aws_creds(), config=BOTO_CONFIG)
     save_results(case_result_scores, case_result_counts, results_dir, None if dont_post else s3_client, timestamp_key)
 
     end_s = time.time()
@@ -469,45 +541,45 @@ def run_all_cases(
     logger.info(f"Results:\n\t{dict(total_result_counts)}")
     save_results(case_result_scores, case_result_counts, results_dir, None if dont_post else s3_client, timestamp_key)
 
+
 def resolve_device(args):
     if torch.cuda.is_available():
-        device = 'cuda'
+        device = "cuda"
     elif args.cuda_only:
         raise RuntimeError("Cuda not available")
     elif torch.backends.mps.is_available():
-        device = 'mps'
+        device = "mps"
     else:
-        device = 'cpu'
+        device = "cpu"
     logger.info(f"Using device {device}")
     return device
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     parser = ArgumentParser()
+    parser.add_argument("--limit", type=int, required=False, help="Run one case model on some docs, for testing")
+    parser.add_argument("--local_models", action="store_true", help="Load HF models from disk instead of S3")
     parser.add_argument(
-        '--limit', type=int, required=False,
-        help='Run one case model on some docs, for testing'
+        "--local_data",
+        action="store_true",
+        help="Load docs, points, and docbot history from disk instead of calling Phoenix APIs",
     )
     parser.add_argument(
-        '--local_models', action='store_true',
-        help='Load HF models from disk instead of S3'
+        "--dont_post",
+        action="store_true",
+        help="Instead of POSTing new docbot history and new points to Phoenix, just print",
     )
     parser.add_argument(
-        '--local_data', action='store_true',
-        help='Load docs, points, and docbot history from disk instead of calling Phoenix APIs'
+        "--skip_point_check",
+        action="store_true",
+        help="Dont avoid running case/doc pairs that already have existing points (used for local inference)",
     )
     parser.add_argument(
-        '--dont_post', action='store_true',
-        help='Instead of POSTing new docbot history and new points to Phoenix, just print'
+        "--cuda_only",
+        action="store_true",
+        help="Only run if cuda hardware is available. Will still run on CUDA if not set, this just enforces it.",
     )
-    parser.add_argument(
-        '--skip_point_check', action='store_true',
-        help='Dont avoid running case/doc pairs that already have existing points (used for local inference)'
-    )
-    parser.add_argument(
-        '--cuda_only', action='store_true',
-        help='Only run if cuda hardware is available. Will still run on CUDA if not set, this just enforces it.'
-    )
-    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.set_defaults(local_models=False, local_data=False, dont_post=False, cuda_only=False, skip_point_check=False)
     args = parser.parse_args()
 

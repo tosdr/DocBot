@@ -28,11 +28,11 @@ except Exception:
 MAX_EXPANSION_SENTENCES = 3
 
 # Used for huggingface's from_pretrained()
-BASE_MODEL_NAME = 'bert-base-uncased'
+BASE_MODEL_NAME = "bert-base-uncased"
 
 # This has to match the upload key specified when training. It will also be used by apply_docbot.py to record whether
 # docbot has already ran docs, so if we train a new model and want to rerun, this should be updated.
-MODEL_VERSION = 'v3'
+MODEL_VERSION = "v3"
 
 # Case-specific positive prediction thresholds. These come from pr_curves.ipynb, and optimize fscore with beta=1.5
 THRESHOLDS = {
@@ -158,8 +158,9 @@ THRESHOLDS = {
     481: 0.8873093724250793,
     482: 0.996204674243927,
     484: 0.9723506569862366,
-    486: 0.9942421317100525
+    486: 0.9942421317100525,
 }
+
 
 def detect_lang(text: str):
     try:
@@ -168,27 +169,31 @@ def detect_lang(text: str):
         logger.error(f"Problem detecting lang: {e}")
         return None
 
+
 def test_gpu_memory(batch_size, model, device, model_max_length):
     # Ensure we have enough GPU memory for the largest possible batch size
     tokens = torch.zeros(size=(batch_size, model_max_length), dtype=torch.int64, device=device)
     model(tokens)
     return
 
+
 def load_prefilter_kwargs(case_id):
     from tfidf import model_output_dir
+
     prefilter_dir = model_output_dir(case_id)
     return {
-        'vectorizer': pickle.load(open(prefilter_dir / 'vectorizer.pkl', 'rb')),
-        'model': pickle.load(open(prefilter_dir / 'model.pkl', 'rb')),
-        'threshold': pickle.load(open(prefilter_dir / 'final_metrics.pkl', 'rb'))['threshold'],
+        "vectorizer": pickle.load(open(prefilter_dir / "vectorizer.pkl", "rb")),
+        "model": pickle.load(open(prefilter_dir / "model.pkl", "rb")),
+        "threshold": pickle.load(open(prefilter_dir / "final_metrics.pkl", "rb"))["threshold"],
         # Disable all components except tokenizer for faster ngram extraction
-        'spacy_model': spacy.load(
-            'en_core_web_md', disable=['tok2vec', 'tagger', 'parser', 'attribute_ruler', 'lemmatizer', 'ner']
-        )
+        "spacy_model": spacy.load(
+            "en_core_web_md", disable=["tok2vec", "tagger", "parser", "attribute_ruler", "lemmatizer", "ner"]
+        ),
     }
 
+
 def apply_prefilter(
-        text: str, sent_boundaries: list[int], vectorizer, model, threshold, spacy_model
+    text: str, sent_boundaries: list[int], vectorizer, model, threshold, spacy_model
 ) -> tuple[np.ndarray, float]:
     """
     Applies a high-recall TF-IDF classification model as a prefilter. Must let at least one sentence through the filter,
@@ -199,7 +204,7 @@ def apply_prefilter(
     num_sentences = len(sent_boundaries) - 1
     terms: list[list[str]] = []
     for sent_idx in range(num_sentences):
-        sent_text = text[sent_boundaries[sent_idx]:sent_boundaries[sent_idx + 1]]
+        sent_text = text[sent_boundaries[sent_idx] : sent_boundaries[sent_idx + 1]]
         terms.append([span.text.lower() for span in extract.ngrams(spacy_model(sent_text), n=[1, 2])])
 
     # Sparse matrix of term counts
@@ -215,11 +220,16 @@ def apply_prefilter(
     filter_rate = prefilter_mask.sum() / num_sentences
     return prefilter_mask, filter_rate
 
+
 def apply_sent_span_model(
-        text: str, sent_boundaries: list[int],
-        prefilter_kwargs,
-        tokenizer, hf_model, batch_size, device,
-        off_limits: list[tuple[int, int]]=None
+    text: str,
+    sent_boundaries: list[int],
+    prefilter_kwargs,
+    tokenizer,
+    hf_model,
+    batch_size,
+    device,
+    off_limits: list[tuple[int, int]] = None,
 ) -> None | tuple[float, int, int, int, float]:
     """
     Takes a model that was trained for text classification on sentence spans (usually 1 or 2, but potentially 5+)
@@ -243,7 +253,7 @@ def apply_sent_span_model(
     num_sentences = len(sent_boundaries) - 1
 
     # Most of the sentences we can quickly disqualify by testing for key terms, via a TF-IDF classifier prefilter
-    #TODO precompute / use doc cache for prefilter tokenization so they are shared between cases?
+    # TODO precompute / use doc cache for prefilter tokenization so they are shared between cases?
     prefilter_mask, filter_rate = apply_prefilter(text, sent_boundaries, **prefilter_kwargs)
     logger.debug(f"TF-IDF prefilter applied with filter rate {filter_rate:.2f}")
 
@@ -263,20 +273,20 @@ def apply_sent_span_model(
     def _batch(iterable, n=batch_size):
         iter_len = len(iterable)
         for idx in range(0, iter_len, n):
-            yield iterable[idx: min(idx + n, iter_len)]
+            yield iterable[idx : min(idx + n, iter_len)]
 
     valid_sent_indices = np.where(~np.array(sent_off_limits))[0]
     # Edge case: if the entire document is off limits, there's nothing to return
     if len(valid_sent_indices) == 0:
         return None
 
-    sent_texts = [text[sent_boundaries[i]: sent_boundaries[i + 1]] for i in valid_sent_indices]
+    sent_texts = [text[sent_boundaries[i] : sent_boundaries[i + 1]] for i in valid_sent_indices]
     softmax_probs = []
     for batch in _batch(sent_texts):
-        tokens = tokenizer(batch, return_tensors='pt', padding=True, truncation=True)
+        tokens = tokenizer(batch, return_tensors="pt", padding=True, truncation=True)
         tokens.to(device)
         preds = hf_model(**tokens)
-        softmax_probs += f.softmax(preds.logits, dim=1)[:,1].tolist()
+        softmax_probs += f.softmax(preds.logits, dim=1)[:, 1].tolist()
     softmax_probs = np.array(softmax_probs)
     best_score = softmax_probs.max()
     best_sent_idx = valid_sent_indices[softmax_probs.argmax()]
@@ -291,16 +301,14 @@ def apply_sent_span_model(
     for i in range(prior_sents_considered):
         if sent_off_limits[best_sent_idx - (i + 1)]:
             break
-        texts_with_priors.append(
-            text[sent_boundaries[best_sent_idx - (i + 1)]:sent_boundaries[best_sent_idx + 1]]
-        )
+        texts_with_priors.append(text[sent_boundaries[best_sent_idx - (i + 1)] : sent_boundaries[best_sent_idx + 1]])
     if len(texts_with_priors) > 0:
         softmax_probs = []
         for batch in _batch(texts_with_priors):
-            tokens = tokenizer(batch, return_tensors='pt', padding=True, truncation=True)
+            tokens = tokenizer(batch, return_tensors="pt", padding=True, truncation=True)
             tokens.to(device)
             preds = hf_model(**tokens)
-            softmax_probs += f.softmax(preds.logits, dim=1)[:,1].tolist()
+            softmax_probs += f.softmax(preds.logits, dim=1)[:, 1].tolist()
         softmax_probs = np.array(softmax_probs)
         best_score_with_priors = softmax_probs.max()
         if best_score_with_priors > best_score:
@@ -316,16 +324,16 @@ def apply_sent_span_model(
         if sent_off_limits[best_sent_idx + i + 1]:
             break
         texts_with_afters.append(
-            text[sent_boundaries[best_sent_idx - num_prior]:sent_boundaries[best_sent_idx + i + 2]]
+            text[sent_boundaries[best_sent_idx - num_prior] : sent_boundaries[best_sent_idx + i + 2]]
         )
 
     if len(texts_with_afters) > 0:
         softmax_probs = []
         for batch in _batch(texts_with_afters):
-            tokens = tokenizer(batch, return_tensors='pt', padding=True, truncation=True)
+            tokens = tokenizer(batch, return_tensors="pt", padding=True, truncation=True)
             tokens.to(device)
             preds = hf_model(**tokens)
-            softmax_probs += f.softmax(preds.logits, dim=1)[:,1].tolist()
+            softmax_probs += f.softmax(preds.logits, dim=1)[:, 1].tolist()
 
         softmax_probs = np.array(softmax_probs)
         best_score_with_afters = softmax_probs.max()
@@ -334,35 +342,35 @@ def apply_sent_span_model(
             num_after = softmax_probs.argmax() + 1
 
     # Return winning score, char span, how many sentences it spans, and the prefilter filter rate
-    return best_score,\
-        sent_boundaries[best_sent_idx - num_prior],\
-        sent_boundaries[best_sent_idx + num_after + 1],\
-        1 + num_prior + num_after,\
-        filter_rate
+    return (
+        best_score,
+        sent_boundaries[best_sent_idx - num_prior],
+        sent_boundaries[best_sent_idx + num_after + 1],
+        1 + num_prior + num_after,
+        filter_rate,
+    )
 
 
-def attach_predictions(doc_df, tokenizer, sent_boundaries, model, batch_size=4, device='cpu'):
+def attach_predictions(doc_df, tokenizer, sent_boundaries, model, batch_size=4, device="cpu"):
     """
     Supports evaluation during train.py
     Instead of selecting the class with a higher logit, this gathers post-softmax probabilities and
     uses whatever threshold optimizes F1 of the dataset
     """
     doc_df = doc_df.copy()
-    for idx, instance in tqdm(doc_df.iterrows(), total=len(doc_df), desc=f'Applying model to docs on {device}'):
+    for idx, instance in tqdm(doc_df.iterrows(), total=len(doc_df), desc=f"Applying model to docs on {device}"):
         ret = apply_sent_span_model(
-            instance.text, sent_boundaries[instance.id_doc], tokenizer, model,
-            batch_size=batch_size, device=device
+            instance.text, sent_boundaries[instance.id_doc], tokenizer, model, batch_size=batch_size, device=device
         )
         if ret is not None:
             score, start, end, num_sents, filter_rate = ret
-            doc_df.at[idx, 'pred_score'] = score
-            doc_df.at[idx, 'pred_char_start'] = start
-            doc_df.at[idx, 'pred_char_end'] = end
-            doc_df.at[idx, 'pred_num_sents'] = num_sents
-            doc_df.at[idx, 'prefilter_rate'] = filter_rate
+            doc_df.at[idx, "pred_score"] = score
+            doc_df.at[idx, "pred_char_start"] = start
+            doc_df.at[idx, "pred_char_end"] = end
+            doc_df.at[idx, "pred_num_sents"] = num_sents
+            doc_df.at[idx, "prefilter_rate"] = filter_rate
 
-    doc_df['int_labels'] = [0 if i == 'negative' else 1 for i in doc_df.label]
+    doc_df["int_labels"] = [0 if i == "negative" else 1 for i in doc_df.label]
     threshold = utils.optimal_threshold(doc_df.pred_score, doc_df.int_labels)[0]
-    doc_df['pred_label'] = [1 if bool_pred else 0 for bool_pred in doc_df.pred_score >= threshold]
+    doc_df["pred_label"] = [1 if bool_pred else 0 for bool_pred in doc_df.pred_score >= threshold]
     return doc_df
-

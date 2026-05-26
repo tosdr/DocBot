@@ -18,16 +18,16 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 here = Path(__file__).parent
 
-MIN_APPROVED = 40     # Focus on cases with enough approved points to fine-tune and evaluate
-NUM_FOLDS = 5         # Pre-determined train-test splits for downstream ML
+MIN_APPROVED = 40  # Focus on cases with enough approved points to fine-tune and evaluate
+NUM_FOLDS = 5  # Pre-determined train-test splits for downstream ML
 
-DB_DUMP_VERSION = '2026-01-28'
-DB_DUMP_VERSIONS_VERSION = '2026-04-18'     # `versions` table was exported separately
-LATEST_VERSION = 'v1'
+DB_DUMP_VERSION = "2026-01-28"
+DB_DUMP_VERSIONS_VERSION = "2026-04-18"  # `versions` table was exported separately
+LATEST_VERSION = "v1"
 
 # Outputs are saved here
-SENT_SPAN_LOC = here / f'../data/db_dumps/{DB_DUMP_VERSION}/sent_span_classification_{LATEST_VERSION}.pkl'
-DOC_LOC = here / f'../data/db_dumps/{DB_DUMP_VERSION}/doc_classification_{LATEST_VERSION}.pkl'
+SENT_SPAN_LOC = here / f"../data/db_dumps/{DB_DUMP_VERSION}/sent_span_classification_{LATEST_VERSION}.pkl"
+DOC_LOC = here / f"../data/db_dumps/{DB_DUMP_VERSION}/doc_classification_{LATEST_VERSION}.pkl"
 
 """
 This module takes database dumps (cleaned up by explore.ipynb) and forms two binary text classification datasets
@@ -63,12 +63,14 @@ Instances of the document datasets look very similar to the `documents` table ex
 
 # Utility functions, to load after this script has been run
 def load_sent_span() -> dict[int, pd.DataFrame]:
-    with open(SENT_SPAN_LOC, 'rb') as f:
+    with open(SENT_SPAN_LOC, "rb") as f:
         return pickle.load(f)
 
+
 def load_docs() -> dict[int, pd.DataFrame]:
-    with open(DOC_LOC, 'rb') as f:
+    with open(DOC_LOC, "rb") as f:
         return pickle.load(f)
+
 
 def _load_pending_not_found(versions: pd.DataFrame, points: pd.DataFrame) -> dict[int, set[int]]:
     """
@@ -80,14 +82,15 @@ def _load_pending_not_found(versions: pd.DataFrame, points: pd.DataFrame) -> dic
 
     for i, version in versions.iterrows():
         # We serialize the point attributes as yaml
-        if version.item_type == 'Point' and pd.notna(version.object) and 'status: pending-not-found' in version.object:
+        if version.item_type == "Point" and pd.notna(version.object) and "status: pending-not-found" in version.object:
             point_id = version.item_id
             if point_id in points.index:
-                point_ids[points.loc[point_id, 'case_id']].add(point_id)
+                point_ids[points.loc[point_id, "case_id"]].add(point_id)
                 total += 1
 
     logger.info(f"Found {total} pending-not-found points")
     return point_ids
+
 
 def _get_sent_boundaries(documents) -> dict[int, list[int]]:
     """
@@ -98,27 +101,29 @@ def _get_sent_boundaries(documents) -> dict[int, list[int]]:
     hasher = hashlib.md5()
     for doc_id, text in sorted(zip(documents.id_doc, documents.text), key=lambda x: x[0]):
         hasher.update(str(doc_id).encode())
-        hasher.update(text.encode('utf-8', errors='replace'))
+        hasher.update(text.encode("utf-8", errors="replace"))
     content_hash = hasher.hexdigest()[:10]
     # Since this can take ~20 minutes, cache
-    cache_loc = here / f'../data/db_dumps/{DB_DUMP_VERSION}/doc_sentences_{content_hash}.pkl'
+    cache_loc = here / f"../data/db_dumps/{DB_DUMP_VERSION}/doc_sentences_{content_hash}.pkl"
     try:
-        with open(cache_loc, mode='rb') as f:
+        with open(cache_loc, mode="rb") as f:
             return pickle.load(f)
     except FileNotFoundError:
         logger.info(f"Cached sentence boundaries not found at {cache_loc}")
-        nlp = spacy.load('en_core_web_md', disable=['attribute_ruler', 'lemmatizer', 'ner'])
+        nlp = spacy.load("en_core_web_md", disable=["attribute_ruler", "lemmatizer", "ner"])
         sent_boundaries = dict()
         # Spacy has a default limit of 1mil characters, we have at least one doc with more
         nlp.max_length = 1500000
-        for doc_id, doc in tqdm(zip(documents.id_doc, nlp.pipe(documents.text, n_process=4, batch_size=10)),
-                                total=len(documents),
-                                desc='Splitting sentences'):
+        for doc_id, doc in tqdm(
+            zip(documents.id_doc, nlp.pipe(documents.text, n_process=4, batch_size=10)),
+            total=len(documents),
+            desc="Splitting sentences",
+        ):
             # Filter sentences down to those with actual content
-            sents = list(filter(lambda sent: sent.text != '' and not sent.text.isspace(), doc.sents))
+            sents = list(filter(lambda sent: sent.text != "" and not sent.text.isspace(), doc.sents))
             sent_boundaries[doc_id] = list(sorted(map(lambda s: s.start_char, sents)))
 
-        with open(cache_loc, 'wb') as f:
+        with open(cache_loc, "wb") as f:
             pickle.dump(sent_boundaries, f)
         return sent_boundaries
 
@@ -138,14 +143,15 @@ def _stretch_points(points: pd.DataFrame, sent_boundaries):
             sent_idx_start = max(0, bisect.bisect_right(sent_boundaries[doc_id], point.quote_start) - 1)
             sent_idx_end = bisect.bisect_left(sent_boundaries[doc_id], point.quote_end)
 
-            points.at[point_i, 'sent_idx_start'] = sent_idx_start
-            points.at[point_i, 'sent_idx_end'] = sent_idx_end
+            points.at[point_i, "sent_idx_start"] = sent_idx_start
+            points.at[point_i, "sent_idx_end"] = sent_idx_end
             assert sent_idx_end - sent_idx_start > 0
-            points.at[point_i, 'num_sents'] = sent_idx_end - sent_idx_start
+            points.at[point_i, "num_sents"] = sent_idx_end - sent_idx_start
     points.sent_idx_start = points.sent_idx_start.astype(int)
     points.sent_idx_end = points.sent_idx_end.astype(int)
     points.num_sents = points.num_sents.astype(int)
     return points
+
 
 def _get_sample_window_size_fn(points):
     """
@@ -168,6 +174,7 @@ def _get_sample_window_size_fn(points):
 
     return sample_window_size
 
+
 def _make_surrounding(approved_df, sample_window_size_fn, sent_boundaries, target_case):
     surrounding = []
     for _, point in approved_df[approved_df.case_id == target_case.id].iterrows():
@@ -181,20 +188,20 @@ def _make_surrounding(approved_df, sample_window_size_fn, sent_boundaries, targe
             after_point = point.copy()
             after_point.sent_idx_start = point.sent_idx_end
             # Advance the end a realistic number of sentences
-            after_point.sent_idx_end = min(point.sent_idx_end + sample_window_size_fn(target_case.id),
-                                           len(sent_boundaries[point.document_id]))
+            after_point.sent_idx_end = min(
+                point.sent_idx_end + sample_window_size_fn(target_case.id), len(sent_boundaries[point.document_id])
+            )
             surrounding.append(after_point)
     surrounding_df = pd.DataFrame(surrounding)
     surrounding_df = surrounding_df.assign(
-        label='negative', source='surrounding', point_id=np.nan, status=np.nan, quote_start=np.nan,
-        quote_end=np.nan
+        label="negative", source="surrounding", point_id=np.nan, status=np.nan, quote_start=np.nan, quote_end=np.nan
     )
-    surrounding_df = surrounding_df.drop('id', axis=1)
+    surrounding_df = surrounding_df.drop("id", axis=1)
     return surrounding_df
 
+
 def _make_random_reviewed(
-        approved, documents, points, sample_window_size_fn, sent_boundaries, target_case,
-        comprehensive_threshold: int
+    approved, documents, points, sample_window_size_fn, sent_boundaries, target_case, comprehensive_threshold: int
 ):
     # There is an is_comprehensively_reviewed feature, but also make sure a min number of points were approved for
     # the doc. Avoid any docs that have a point for the case in question.
@@ -204,9 +211,7 @@ def _make_random_reviewed(
     # We'll avoid docs that already have a point for the case, except pending docbot points are ok (we don't want the
     # bias of the previously released model to leak)
     case_points = points[points.case_id == target_case.id]
-    case_points_minus_pending_docbot = case_points[
-        case_points.ml_score.isna() | (case_points.status != 'pending')
-    ]
+    case_points_minus_pending_docbot = case_points[case_points.ml_score.isna() | (case_points.status != "pending")]
     documents_to_avoid = set(case_points_minus_pending_docbot.document_id.unique())
     eligible_docs = eligible_docs[~eligible_docs.id_doc.isin(documents_to_avoid)]
 
@@ -218,17 +223,18 @@ def _make_random_reviewed(
         instance_num_sents = min(sample_window_size_fn(target_case.id), n_sents)
         random_sent_start = n_sents - instance_num_sents
         sent_idx_start = np.random.randint(random_sent_start) if random_sent_start > 0 else 0
-        reviewed_random.append({
-            'case_id': target_case.id,
-            'document_id': doc_id,
-            'service_id': documents.loc[doc_id].service_id,
-            'lang': documents.loc[doc_id].lang,
-            'sent_idx_start': int(sent_idx_start),
-            'sent_idx_end': int(sent_idx_start) + instance_num_sents,
-        })
+        reviewed_random.append(
+            {
+                "case_id": target_case.id,
+                "document_id": doc_id,
+                "service_id": documents.loc[doc_id].service_id,
+                "lang": documents.loc[doc_id].lang,
+                "sent_idx_start": int(sent_idx_start),
+                "sent_idx_end": int(sent_idx_start) + instance_num_sents,
+            }
+        )
     return pd.DataFrame(reviewed_random).assign(
-        label='negative', source='reviewed_random', point_id=np.nan, status=np.nan, quote_start=np.nan,
-        quote_end=np.nan,
+        label="negative", source="reviewed_random", point_id=np.nan, status=np.nan, quote_start=np.nan, quote_end=np.nan
     )
 
 
@@ -236,7 +242,7 @@ def _make_random_from_approved(approved, instance_df, sample_window_size_fn, sen
     doc_random = []
     for doc_id in approved.document_id.unique():
         doc_instances = instance_df[instance_df.document_id == doc_id]
-        existing_ranges = list(doc_instances[['sent_idx_start', 'sent_idx_end']].values)
+        existing_ranges = list(doc_instances[["sent_idx_start", "sent_idx_end"]].values)
         n_sents = len(sent_boundaries[doc_id])
         template = doc_instances.iloc[0]
         # Higher is more diverse, but worse class imbalance
@@ -245,37 +251,45 @@ def _make_random_from_approved(approved, instance_df, sample_window_size_fn, sen
             # write logic to do this perfectly, but the chances of collisions are small (around (5 / n_sentences))
             # so just try it randomly up to 5 times and then move on
             instance_num_sents = sample_window_size_fn(target_case.id)
-            disallowed_sent_idx = set(itertools.chain.from_iterable([range(start - instance_num_sents, end)
-                                                                     for start, end in existing_ranges]))
+            disallowed_sent_idx = set(
+                itertools.chain.from_iterable(
+                    [range(start - instance_num_sents, end) for start, end in existing_ranges]
+                )
+            )
             for sent_idx_start in np.random.randint(n_sents, size=5):
                 if sent_idx_start not in disallowed_sent_idx:
                     sent_idx_end = min(int(sent_idx_start) + instance_num_sents, n_sents)
-                    doc_random.append({
-                        'case_id': template.case_id,
-                        'document_id': doc_id,
-                        'service_id': template.service_id,
-                        'lang': template.lang,
-                        'sent_idx_start': int(sent_idx_start),
-                        'sent_idx_end': sent_idx_end,
-                    })
+                    doc_random.append(
+                        {
+                            "case_id": template.case_id,
+                            "document_id": doc_id,
+                            "service_id": template.service_id,
+                            "lang": template.lang,
+                            "sent_idx_start": int(sent_idx_start),
+                            "sent_idx_end": sent_idx_end,
+                        }
+                    )
                     existing_ranges.append([int(sent_idx_start), sent_idx_end])
                     break
     return pd.DataFrame(doc_random).assign(
-        label='negative', source='doc_random', point_id=np.nan, status=np.nan, quote_start=np.nan, quote_end=np.nan,
+        label="negative", source="doc_random", point_id=np.nan, status=np.nan, quote_start=np.nan, quote_end=np.nan
     )
 
 
 def _make_topical(approved, cases, points, target_case):
-    topical = points[(points.case_id != target_case.id) &
-                     (points.case_id.isin(cases[cases.topic_id == target_case.topic_id].id)) &
-                     (points.status == 'approved')]
+    topical = points[
+        (points.case_id != target_case.id)
+        & (points.case_id.isin(cases[cases.topic_id == target_case.topic_id].id))
+        & (points.status == "approved")
+    ]
     # Remove those that overlap with approved points of the target case
     to_remove = set()
     for i, point in topical.iterrows():
         for i2, approved_point in approved[approved.document_id == point.document_id].iterrows():
             # If overlapping sentence indices
-            if approved_point.sent_idx_start <= (point.sent_idx_end - 1) and\
-                    point.sent_idx_start <= (approved_point.sent_idx_end - 1):
+            if approved_point.sent_idx_start <= (point.sent_idx_end - 1) and point.sent_idx_start <= (
+                approved_point.sent_idx_end - 1
+            ):
                 to_remove.add(i)
                 break
     topical = topical.drop(list(to_remove))
@@ -285,15 +299,14 @@ def _make_topical(approved, cases, points, target_case):
     if len(topical) > desired_num:
         topical = topical.sample(desired_num, random_state=0)
     topical = topical.assign(
-        label='negative', source='topical', point_id=topical.id, status=np.nan, quote_start=np.nan, quote_end=np.nan
+        label="negative", source="topical", point_id=topical.id, status=np.nan, quote_start=np.nan, quote_end=np.nan
     )
-    topical = topical.drop('id', axis=1)
+    topical = topical.drop("id", axis=1)
     return topical
 
 
 def make_sent_span_datasets(
-        cases, documents, points, pending_not_found: dict[int, set[int]],
-        comprehensive_threshold: int, en_only=True
+    cases, documents, points, pending_not_found: dict[int, set[int]], comprehensive_threshold: int, en_only=True
 ) -> dict[int, pd.DataFrame]:
     """
     :param pending_not_found: for each case, a set of point IDs that have ever been in a "pending-not-found" state. We
@@ -306,16 +319,16 @@ def make_sent_span_datasets(
             `source` is one of ['approved', 'declined', 'surrounding', 'topical', 'random']
     """
     if en_only:
-        documents = documents[documents.lang == 'en'].copy()
-        points = points[points.lang == 'en'].copy()
+        documents = documents[documents.lang == "en"].copy()
+        points = points[points.lang == "en"].copy()
     no_quote = points.quote_start.isna()
     logger.info(f"Dropping {no_quote.sum()} points with no quote start/end")
     points = points[~no_quote]
 
-    point_counts = points[points.status == 'approved'].case_id.value_counts()
-    cases.loc[point_counts.index, 'num_approved'] = point_counts
-    point_counts = points[points.status == 'approved'].document_id.value_counts()
-    documents.loc[point_counts.index, 'num_approved'] = point_counts
+    point_counts = points[points.status == "approved"].case_id.value_counts()
+    cases.loc[point_counts.index, "num_approved"] = point_counts
+    point_counts = points[points.status == "approved"].document_id.value_counts()
+    documents.loc[point_counts.index, "num_approved"] = point_counts
 
     deprecated_doc_ids = set(documents.loc[documents.is_deprecated].index)
 
@@ -331,25 +344,41 @@ def make_sent_span_datasets(
     case_datasets = dict()
     for case_i, target_case in cases[cases.num_approved >= MIN_APPROVED].iterrows():
         case_datasets[target_case.id] = _build_sent_span_case_dataset(
-            target_case, case_i, cases, documents, points, sent_boundaries,
-            sample_window_size_fn, deprecated_doc_ids, pending_not_found, comprehensive_threshold,
+            target_case,
+            case_i,
+            cases,
+            documents,
+            points,
+            sent_boundaries,
+            sample_window_size_fn,
+            deprecated_doc_ids,
+            pending_not_found,
+            comprehensive_threshold,
         )
     return case_datasets
 
 
 def _build_sent_span_case_dataset(
-        target_case, case_i, cases, documents, points, sent_boundaries,
-        sample_window_size_fn, deprecated_doc_ids, pending_not_found, comprehensive_threshold,
+    target_case,
+    case_i,
+    cases,
+    documents,
+    points,
+    sent_boundaries,
+    sample_window_size_fn,
+    deprecated_doc_ids,
+    pending_not_found,
+    comprehensive_threshold,
 ) -> pd.DataFrame:
     logger.info(f"{('=' * 20)} Case {case_i} {('=' * 20)}")
 
     # Use approved points as a starting point. Rename `id` -> `point_id` here so all sources share the same schema.
-    approved = points[(points.case_id == target_case.id) & (points.status == 'approved')]
-    approved = approved.assign(label='positive', source='approved', point_id=approved.id).drop('id', axis=1)
+    approved = points[(points.case_id == target_case.id) & (points.status == "approved")]
+    approved = approved.assign(label="positive", source="approved", point_id=approved.id).drop("id", axis=1)
     logger.info(f"{len(approved)} approved points")
 
     # Declined points, minus a few edge cases
-    declined = points[(points.case_id == target_case.id) & (points.status == 'declined')]
+    declined = points[(points.case_id == target_case.id) & (points.status == "declined")]
     # Avoid points whose doc already has an approved point (often declined only because there's a better one)
     has_approved = declined.document_id.isin(set(approved.document_id))
     # Avoid points that were ever in a pending-not-found status, in case they are true negatives
@@ -357,9 +386,11 @@ def _build_sent_span_case_dataset(
     # Avoid points from deprecated services or documents, because sometimes they were declined just for that
     was_deprecated = declined.document_id.isin(deprecated_doc_ids)
     declined = declined[~has_approved & ~was_pending_not_found & ~was_deprecated]
-    logger.info(f"{len(declined)} declined points (excluded {has_approved.sum()} with approved doc,"
-                f" {was_pending_not_found.sum()} pending-not-found, {was_deprecated.sum()} deprecated)")
-    declined = declined.assign(label='negative', source='declined', point_id=declined.id).drop('id', axis=1)
+    logger.info(
+        f"{len(declined)} declined points (excluded {has_approved.sum()} with approved doc,"
+        f" {was_pending_not_found.sum()} pending-not-found, {was_deprecated.sum()} deprecated)"
+    )
+    declined = declined.assign(label="negative", source="declined", point_id=declined.id).drop("id", axis=1)
 
     # Segments just before and after positive examples — sharpens evidence vs. topic discrimination
     surrounding_df = _make_surrounding(approved, sample_window_size_fn, sent_boundaries, target_case)
@@ -373,28 +404,26 @@ def _build_sent_span_case_dataset(
     # avoid sentence spans already represented. Pending points for the target case are included as
     # exclusion-only ranges — they may be true evidence (e.g. unreviewed docbot predictions) so we
     # don't want a doc_random window landing on them.
-    pending_exclude = points[(points.case_id == target_case.id) & (points.status == 'pending')]
+    pending_exclude = points[(points.case_id == target_case.id) & (points.status == "pending")]
     so_far = pd.concat([approved, declined, surrounding_df, topical, pending_exclude])
-    doc_random_df = _make_random_from_approved(
-        approved, so_far, sample_window_size_fn, sent_boundaries, target_case
-    )
+    doc_random_df = _make_random_from_approved(approved, so_far, sample_window_size_fn, sent_boundaries, target_case)
     logger.info(f"{len(doc_random_df)} random points from docs with approved")
 
     # Random segments of comprehensively reviewed docs
     reviewed_random_df = _make_random_reviewed(
-        approved, documents, points, sample_window_size_fn, sent_boundaries, target_case,
-        comprehensive_threshold,
+        approved, documents, points, sample_window_size_fn, sent_boundaries, target_case, comprehensive_threshold
     )
     logger.info(f"{len(reviewed_random_df)} random points from reviewed docs")
 
     instance_df = pd.concat([approved, declined, surrounding_df, topical, doc_random_df, reviewed_random_df])
 
     # Reset num_sents — the sources above were not consistent about setting it
-    instance_df['num_sents'] = instance_df.sent_idx_end - instance_df.sent_idx_start
+    instance_df["num_sents"] = instance_df.sent_idx_end - instance_df.sent_idx_start
 
     # Extract the string content for each instance based on sent positions
-    instance_df['char_start'] = instance_df.apply(
-        lambda i: int(sent_boundaries[i.document_id][i.sent_idx_start]), axis=1)
+    instance_df["char_start"] = instance_df.apply(
+        lambda i: int(sent_boundaries[i.document_id][i.sent_idx_start]), axis=1
+    )
 
     def _char_end(i):
         # If an instance ends at the very end of the doc, the "end sentence" position doesn't exist
@@ -403,19 +432,21 @@ def _build_sent_span_case_dataset(
         if i.sent_idx_end < len(sent_pos):
             return int(sent_pos[i.sent_idx_end])
         return len(documents.loc[i.document_id].text)
-    instance_df['char_end'] = instance_df.apply(_char_end, axis=1)
-    instance_df['text'] = instance_df.apply(
-        lambda i: documents.loc[i.document_id].text[i.char_start:i.char_end], axis=1)
+
+    instance_df["char_end"] = instance_df.apply(_char_end, axis=1)
+    instance_df["text"] = instance_df.apply(
+        lambda i: documents.loc[i.document_id].text[i.char_start : i.char_end], axis=1
+    )
 
     return instance_df.drop(
-        ['analysis', 'created_at', 'updated_at', 'service_needs_rating_update', 'user_id', 'point_change'],
-        axis=1, errors='ignore',
+        ["analysis", "created_at", "updated_at", "service_needs_rating_update", "user_id", "point_change"],
+        axis=1,
+        errors="ignore",
     ).reset_index(drop=True)
 
 
 def make_doc_datasets(
-        cases, documents, points, pending_not_found: dict[int, set[int]], comprehensive_threshold: int,
-        en_only=True
+    cases, documents, points, pending_not_found: dict[int, set[int]], comprehensive_threshold: int, en_only=True
 ) -> dict[int, pd.DataFrame]:
     """
     :param comprehensive_threshold: a doc needs to have this many approved points before we assume it's reviewed
@@ -426,12 +457,12 @@ def make_doc_datasets(
             `source` is one of ['approved', 'declined', 'random']
     """
     if en_only:
-        documents = documents[documents.lang == 'en'].copy()
-        points = points[points.lang == 'en'].copy()
+        documents = documents[documents.lang == "en"].copy()
+        points = points[points.lang == "en"].copy()
 
     # Attach num points
-    point_counts = points[points.status == 'approved'].document_id.value_counts()
-    documents.loc[point_counts.index, 'num_approved'] = point_counts
+    point_counts = points[points.status == "approved"].document_id.value_counts()
+    documents.loc[point_counts.index, "num_approved"] = point_counts
 
     deprecated_doc_ids = set(documents.loc[documents.is_deprecated].index)
 
@@ -446,39 +477,34 @@ def make_doc_datasets(
     case_datasets = dict()
     for case_i, target_case in cases[cases.num_approved >= MIN_APPROVED].iterrows():
         case_points = points[points.case_id == target_case.id]
-        approved = case_points[case_points.status == 'approved']
+        approved = case_points[case_points.status == "approved"]
         # `reindex` + dropna so an unexpected missing doc doesn't blow up the whole case
-        approved_docs = documents.reindex(approved.document_id.unique()).dropna(subset=['id_doc'])
-        approved_docs = approved_docs.assign(label='positive', source='approved')
+        approved_docs = documents.reindex(approved.document_id.unique()).dropna(subset=["id_doc"])
+        approved_docs = approved_docs.assign(label="positive", source="approved")
 
         # Docs with declined points, minus a few edge cases
-        declined_points = case_points[case_points.status == 'declined']
-        declined_doc_ids = (
-            set(declined_points.document_id.unique()) - set(approved_docs.id_doc) - deprecated_doc_ids
-        )
+        declined_points = case_points[case_points.status == "declined"]
+        declined_doc_ids = set(declined_points.document_id.unique()) - set(approved_docs.id_doc) - deprecated_doc_ids
         # Also filter out any docs with points that were ever pending-not-found, just in case it's a true negative
         pending_not_found_docs = set()
         for point_id in pending_not_found[case_i]:
             if point_id in case_points.index:
-                pending_not_found_docs.add(case_points.loc[point_id, 'document_id'])
+                pending_not_found_docs.add(case_points.loc[point_id, "document_id"])
         declined_doc_ids -= pending_not_found_docs
-        declined_docs = documents.reindex(list(declined_doc_ids)).dropna(subset=['id_doc'])
-        declined_docs = declined_docs.assign(label='negative', source='declined')
+        declined_docs = documents.reindex(list(declined_doc_ids)).dropna(subset=["id_doc"])
+        declined_docs = declined_docs.assign(label="negative", source="declined")
 
         # All comprehensively reviewed docs. Avoid any docs that have a point for the case, except pending
         # docbot points (we don't want the bias of the previously released model to leak)
-        case_points_minus_pending_docbot = case_points[
-            case_points.ml_score.isna() | (case_points.status != 'pending')
-        ]
+        case_points_minus_pending_docbot = case_points[case_points.ml_score.isna() | (case_points.status != "pending")]
         documents_to_avoid = set(case_points_minus_pending_docbot.document_id.unique())
-        reviewed_docs = comprehensively_reviewed_docs[
-            ~comprehensively_reviewed_docs.id_doc.isin(documents_to_avoid)
-        ]
-        reviewed_docs = reviewed_docs.assign(label='negative', source='reviewed')
+        reviewed_docs = comprehensively_reviewed_docs[~comprehensively_reviewed_docs.id_doc.isin(documents_to_avoid)]
+        reviewed_docs = reviewed_docs.assign(label="negative", source="reviewed")
 
         instance_df = pd.concat([approved_docs, declined_docs, reviewed_docs])
-        case_datasets[target_case.id] = instance_df[['id_doc', 'text', 'id_service', 'label', 'source']]\
-            .reset_index(drop=True)
+        case_datasets[target_case.id] = instance_df[["id_doc", "text", "id_service", "label", "source"]].reset_index(
+            drop=True
+        )
 
     return case_datasets
 
@@ -491,16 +517,18 @@ def assign_folds(sent_span_datasets, doc_datasets):
     fold gets a representative share (positives are rare for many cases, and uniform doc-ID shuffling
     leaves cross-fold variance high).
     """
+
     def _gen_fold_slice(n, fold_i):
-        return slice(round(fold_i * (n / NUM_FOLDS)), round((fold_i+1) * (n / NUM_FOLDS)))
+        return slice(round(fold_i * (n / NUM_FOLDS)), round((fold_i + 1) * (n / NUM_FOLDS)))
 
     rng = random.Random(0)
     for case_id in set(sent_span_datasets.keys()).union(set(doc_datasets.keys())):
         sent_df = sent_span_datasets[case_id]
         doc_df = doc_datasets[case_id]
 
-        positive_doc_ids = set(sent_df.loc[sent_df.label == 'positive', 'document_id'])\
-            .union(set(doc_df.loc[doc_df.label == 'positive', 'id_doc']))
+        positive_doc_ids = set(sent_df.loc[sent_df.label == "positive", "document_id"]).union(
+            set(doc_df.loc[doc_df.label == "positive", "id_doc"])
+        )
         all_doc_ids = set(sent_df.document_id).union(set(doc_df.id_doc))
         negative_only_doc_ids = all_doc_ids - positive_doc_ids
 
@@ -510,68 +538,71 @@ def assign_folds(sent_span_datasets, doc_datasets):
         rng.shuffle(negative_only_doc_ids)
 
         for fold_i in range(NUM_FOLDS):
-            fold_doc_ids = set(positive_doc_ids[_gen_fold_slice(len(positive_doc_ids), fold_i)]) \
-                | set(negative_only_doc_ids[_gen_fold_slice(len(negative_only_doc_ids), fold_i)])
-            sent_df.loc[sent_df.document_id.isin(fold_doc_ids), 'fold'] = fold_i
-            doc_df.loc[doc_df.id_doc.isin(fold_doc_ids), 'fold'] = fold_i
+            fold_doc_ids = set(positive_doc_ids[_gen_fold_slice(len(positive_doc_ids), fold_i)]) | set(
+                negative_only_doc_ids[_gen_fold_slice(len(negative_only_doc_ids), fold_i)]
+            )
+            sent_df.loc[sent_df.document_id.isin(fold_doc_ids), "fold"] = fold_i
+            doc_df.loc[doc_df.id_doc.isin(fold_doc_ids), "fold"] = fold_i
         sent_df.fold = sent_df.fold.astype(int)
         doc_df.fold = doc_df.fold.astype(int)
         for fold_i in range(NUM_FOLDS):
-            sent_pos = ((sent_df.fold == fold_i) & (sent_df.label == 'positive')).sum()
-            doc_pos = ((doc_df.fold == fold_i) & (doc_df.label == 'positive')).sum()
+            sent_pos = ((sent_df.fold == fold_i) & (sent_df.label == "positive")).sum()
+            doc_pos = ((doc_df.fold == fold_i) & (doc_df.label == "positive")).sum()
             if sent_pos == 0 or doc_pos == 0:
-                logger.warning(f"Case {case_id} fold {fold_i}: {sent_pos} sent-span positives, "
-                               f"{doc_pos} doc positives — downstream metrics may be unreliable")
+                logger.warning(
+                    f"Case {case_id} fold {fold_i}: {sent_pos} sent-span positives, "
+                    f"{doc_pos} doc positives — downstream metrics may be unreliable"
+                )
         sent_span_datasets[case_id] = sent_df
         doc_datasets[case_id] = doc_df
 
     return sent_span_datasets, doc_datasets
 
+
 def run():
     np.random.seed(0)
 
-    cases = pd.read_pickle(here / f'../data/db_dumps/{DB_DUMP_VERSION}/cases_clean.pkl')
-    documents = pd.read_pickle(here / f'../data/db_dumps/{DB_DUMP_VERSION}/documents_clean.pkl')
-    points = pd.read_pickle(here / f'../data/db_dumps/{DB_DUMP_VERSION}/points_clean.pkl')
-    services = pd.read_pickle(here / f'../data/db_dumps/{DB_DUMP_VERSION}/services_clean.pkl')
-    versions = pd.read_pickle(here / f'../data/db_dumps/{DB_DUMP_VERSIONS_VERSION}/versions.pkl')
+    cases = pd.read_pickle(here / f"../data/db_dumps/{DB_DUMP_VERSION}/cases_clean.pkl")
+    documents = pd.read_pickle(here / f"../data/db_dumps/{DB_DUMP_VERSION}/documents_clean.pkl")
+    points = pd.read_pickle(here / f"../data/db_dumps/{DB_DUMP_VERSION}/points_clean.pkl")
+    services = pd.read_pickle(here / f"../data/db_dumps/{DB_DUMP_VERSION}/services_clean.pkl")
+    versions = pd.read_pickle(here / f"../data/db_dumps/{DB_DUMP_VERSIONS_VERSION}/versions.pkl")
 
     # Drop points not associated with a doc
     points = points[points.document_id.notna()]
 
     # Join service info onto documents, avoiding duplicate columns
     documents = pd.merge(
-        documents.drop(['id_service', 'name_service'], axis=1),
+        documents.drop(["id_service", "name_service"], axis=1),
         services,
-        left_on='service_id', right_index=True, suffixes=['_doc', '_service']
+        left_on="service_id",
+        right_index=True,
+        suffixes=["_doc", "_service"],
     )
     # Docs and services with a `deleted` status were dropped in explore.ipynb, but as of 5/26 we don't always use it,
     # instead adding 'deprecated' to the name somewhere
-    documents['is_deprecated'] = (
-        documents.name_doc.str.lower().str.contains('deprecated', na=False) |
-        documents.name_service.str.lower().str.contains('deprecated', na=False)
-    )
+    documents["is_deprecated"] = documents.name_doc.str.lower().str.contains(
+        "deprecated", na=False
+    ) | documents.name_service.str.lower().str.contains("deprecated", na=False)
     # Clean up html, which is necessary for good sentence splitting. This should be done for inference as well.
-    documents['text'] = documents.text.apply(utils.preprocess_doc_text)
-    points['text'] = points.quote_text.apply(lambda text: None if pd.isna(text) else utils.preprocess_doc_text(text))
+    documents["text"] = documents.text.apply(utils.preprocess_doc_text)
+    points["text"] = points.quote_text.apply(lambda text: None if pd.isna(text) else utils.preprocess_doc_text(text))
     # type coercion
-    points['document_id'] = points.document_id.astype(np.int64)
+    points["document_id"] = points.document_id.astype(np.int64)
 
     # Load points that have ever been in a pending-not-found state
     pending_not_found: dict[int, set[int]] = _load_pending_not_found(versions, points)
 
     comprehensive_threshold = 12
-    sent_span_datasets = make_sent_span_datasets(
-        cases, documents, points, pending_not_found, comprehensive_threshold
-    )
+    sent_span_datasets = make_sent_span_datasets(cases, documents, points, pending_not_found, comprehensive_threshold)
     doc_datasets = make_doc_datasets(cases, documents, points, pending_not_found, comprehensive_threshold)
     sent_span_datasets, doc_datasets = assign_folds(sent_span_datasets, doc_datasets)
 
     logger.info(f"Saving sentence span classification datasets to {SENT_SPAN_LOC}")
-    with open(SENT_SPAN_LOC, 'wb') as f:
+    with open(SENT_SPAN_LOC, "wb") as f:
         pickle.dump(sent_span_datasets, f)
     logger.info(f"Saving document classification datasets to {DOC_LOC}")
-    with open(DOC_LOC, 'wb') as f:
+    with open(DOC_LOC, "wb") as f:
         pickle.dump(doc_datasets, f)
 
     case_id = np.random.choice(list(sent_span_datasets.keys()))
@@ -592,5 +623,5 @@ def run():
         logger.info(f"Doc folds: {doc_datasets[case_id].fold.value_counts()}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     run()

@@ -14,15 +14,15 @@ logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 here = Path(__file__).parent
 
-LOCAL_PEFT_PATH = here / f'../data/models/{MODEL_VERSION}/'
-LOCAL_DUMP_VERSION = '2026-01-28'
+LOCAL_PEFT_PATH = here / f"../data/models/{MODEL_VERSION}/"
+LOCAL_DUMP_VERSION = "2026-01-28"
 
 
 def list_case_models() -> set[int]:
     case_ids = set()
     for dirname in os.listdir(LOCAL_PEFT_PATH):
         dirpath = Path(LOCAL_PEFT_PATH / dirname)
-        if dirpath.is_dir() and (dirpath / 'adapter_config.json').exists():
+        if dirpath.is_dir() and (dirpath / "adapter_config.json").exists():
             case_ids.add(int(dirname))
 
     # Make sure these have thresholds
@@ -32,10 +32,12 @@ def list_case_models() -> set[int]:
 
     return case_ids
 
+
 def peft_path(case_id):
     return (LOCAL_PEFT_PATH / str(case_id)).as_posix()
 
-def run_ad_hoc(text_file_paths: list, device='mps', batch_size=16):
+
+def run_ad_hoc(text_file_paths: list, device="mps", batch_size=16):
     """
     Run case models on a group of docs. Finds whatever PEFT adapters exist locally in LOCAL_PEFT_PATH.
     :param text_file_paths: list of string filenames or Path objects to text files to be analyzed
@@ -47,23 +49,23 @@ def run_ad_hoc(text_file_paths: list, device='mps', batch_size=16):
     case_ids = [201]
 
     logger.info("Loading spacy model")
-    spacy_model = spacy.load('en_core_web_md', disable=['attribute_ruler', 'lemmatizer', 'ner'])
+    spacy_model = spacy.load("en_core_web_md", disable=["attribute_ruler", "lemmatizer", "ner"])
 
     texts: list[str] = []
     sent_boundaries: list[list[int]] = []
     filenames: list[str] = []
     for path in text_file_paths:
-        text = open(path, 'r').read()
+        text = open(path, "r").read()
 
         # Preprocess by getting rid of html. Remove blank docs
         content = utils.preprocess_doc_text(text)
-        if content.strip() == '' or inference.detect_lang(content) != 'en':
+        if content.strip() == "" or inference.detect_lang(content) != "en":
             continue
         texts.append(content)
         filenames.append(Path(path).name)
 
         spacy_doc = spacy_model(content)
-        sents = list(filter(lambda sent: sent.text != '' and not sent.text.isspace(), spacy_doc.sents))
+        sents = list(filter(lambda sent: sent.text != "" and not sent.text.isspace(), spacy_doc.sents))
         sent_boundaries.append(list(sorted(map(lambda s: s.start_char, sents))))
 
     logger.info(f"Running {len(text_file_paths)} docs on {len(case_ids)} case IDs: {case_ids}")
@@ -88,5 +90,6 @@ def run_ad_hoc(text_file_paths: list, device='mps', batch_size=16):
                 if score >= inference.THRESHOLDS[case_id]:
                     logger.info(f"{filename} scored {score:.3f} from {best_start}-{best_end} with:\n{evidence_str}")
 
-if __name__ == '__main__':
-    run_ad_hoc(['doc.txt',])
+
+if __name__ == "__main__":
+    run_ad_hoc(["doc.txt"])

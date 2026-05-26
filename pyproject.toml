@@ -46,3 +46,19 @@ infer = [
     "tqdm>=4.67.3",
     "transformers==4.*",
 ]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+ignore = [
+    "E402",     # Module level import not at top of cell
+]
+
+[tool.ruff.format]
+# Prevent trailing commas from forcing parameters onto new lines
+skip-magic-trailing-comma = true
+
+[tool.ruff.lint.isort]
+# Prevent isort from splitting imports on trailing commas
+split-on-trailing-comma = false

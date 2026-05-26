@@ -10,7 +10,7 @@ from src import utils
 
 here = Path(__file__).parent
 
-VERSION = '2026-01-28'
+VERSION = "2026-01-28"
 USE_PARSER_SENTS = True
 USE_MD = True
 
@@ -28,30 +28,32 @@ parser sm: 88.955 seconds
 parser md: 112.923 seconds
 """
 
-if __name__ == '__main__':
-    cases = pickle.load(open(here / f'../data/cases_{VERSION}_clean.pkl', 'rb'))
-    documents = pickle.load(open(here / f'../data/documents_{VERSION}_clean.pkl', 'rb'))
-    points = pickle.load(open(here / f'../data/points_{VERSION}_clean.pkl', 'rb'))
+if __name__ == "__main__":
+    cases = pickle.load(open(here / f"../data/cases_{VERSION}_clean.pkl", "rb"))
+    documents = pickle.load(open(here / f"../data/documents_{VERSION}_clean.pkl", "rb"))
+    points = pickle.load(open(here / f"../data/points_{VERSION}_clean.pkl", "rb"))
 
-    documents = documents[documents.lang == 'en']
-    points = points[points.lang == 'en']
+    documents = documents[documents.lang == "en"]
+    points = points[points.lang == "en"]
 
     # Join Points with Documents, so we can check the quote contexts
-    points = pd.merge(points, documents, how='left', left_on='document_id', right_index=True, suffixes=['_point', '_doc'])
+    points = pd.merge(
+        points, documents, how="left", left_on="document_id", right_index=True, suffixes=["_point", "_doc"]
+    )
     # Also join to attach Case info
-    points = pd.merge(points, cases, left_on='case_id', right_index=True, suffixes=['_point', '_case'])
+    points = pd.merge(points, cases, left_on="case_id", right_index=True, suffixes=["_point", "_case"])
 
-    points['quote_len'] = points.quote_end - points.quote_start
-    approved_points = points[points.status == 'approved']
+    points["quote_len"] = points.quote_end - points.quote_start
+    approved_points = points[points.status == "approved"]
 
     # There's no need to analyze docs without Points
     docs_with_points = documents[documents.index.isin(points.document_id)].head(200)
 
-    spacy_model = 'en_core_web_md' if USE_MD else 'en_core_web_sm'
+    spacy_model = "en_core_web_md" if USE_MD else "en_core_web_sm"
     if USE_PARSER_SENTS:
-        nlp = spacy.load(spacy_model, disable=['attribute_ruler', 'lemmatizer', 'ner'])
+        nlp = spacy.load(spacy_model, disable=["attribute_ruler", "lemmatizer", "ner"])
     else:
-        nlp = spacy.load(spacy_model, disable=['attribute_ruler', 'lemmatizer', 'ner', 'tok2vec', 'parser'])
+        nlp = spacy.load(spacy_model, disable=["attribute_ruler", "lemmatizer", "ner", "tok2vec", "parser"])
         nlp.enable_pipe("senter")
 
     """
@@ -59,16 +61,20 @@ if __name__ == '__main__':
     lots of extraneous content being added to points. Using spacy's is_sent_start attribute won't work because the 
     tokenizer doesn't keep the tag in one token, splitting 'foo.</p>' into ['foo.</p', '>']
     """
-    docs_with_points['text_preprocessed'] = docs_with_points.text.apply(utils.preprocess_doc_text)
+    docs_with_points["text_preprocessed"] = docs_with_points.text.apply(utils.preprocess_doc_text)
 
     start = time.time()
-    for doc_id, doc in zip(docs_with_points.id, nlp.pipe(docs_with_points.text_preprocessed, n_process=4, batch_size=10)):
+    for doc_id, doc in zip(
+        docs_with_points.id, nlp.pipe(docs_with_points.text_preprocessed, n_process=4, batch_size=10)
+    ):
         # Get sentences with actual content
-        sents = list(filter(lambda sent: sent.text != '' and not sent.text.isspace(), doc.sents))
+        sents = list(filter(lambda sent: sent.text != "" and not sent.text.isspace(), doc.sents))
         sent_starts = list(sorted(map(lambda s: s.start_char, sents)))
         for point_id, point in points[points.document_id == doc_id].iterrows():
-            num_sents = (1 + (bisect.bisect_right(sent_starts, point.quote_end) - bisect.bisect_right(sent_starts, point.quote_start)))
-            points.at[point_id, 'num_sents'] = num_sents
+            num_sents = 1 + (
+                bisect.bisect_right(sent_starts, point.quote_end) - bisect.bisect_right(sent_starts, point.quote_start)
+            )
+            points.at[point_id, "num_sents"] = num_sents
 
     end = time.time()
     print(f"Time elapsed: {end - start:.3f}")
@@ -76,5 +82,5 @@ if __name__ == '__main__':
     print(points.num_sents.describe())
 
     for text in docs_with_points.text_preprocessed.sample(20):
-        print('=' * 60)
-        print('🀫'.join(map(str, nlp(text).sents))[250:1250])
+        print("=" * 60)
+        print("🀫".join(map(str, nlp(text).sents))[250:1250])

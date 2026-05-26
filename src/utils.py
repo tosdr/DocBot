@@ -1,15 +1,17 @@
+TAGS_SENT_ENDS = ["</p>", "</li>"]
+TAGS_IGNORE = ["<p>", "<li>", "<b>", "</b>", "<i>", "</i>", "<u>", "</u>", "<ul>", "</ul>", "<strong>", "</strong>"]
 
-TAGS_SENT_ENDS = ['</p>', '</li>']
-TAGS_IGNORE = ['<p>', '<li>', '<b>', '</b>', '<i>', '</i>', '<u>', '</u>', '<ul>', '</ul>', '<strong>', '</strong>']
+
 def preprocess_doc_text(text):
     # The primary motivation here is to fix sentence splitting on </p>, but we might as well clean up other tags too.
     # It's important to keep the string lengths the same, so char_start and char_end annotations don't change.
     # So instead of using a third-party HTML removal lib, we'll just string replace the most common tags
     for tag in TAGS_SENT_ENDS:
-        text = text.replace(tag, '.' + (' ' * (len(tag) - 1)))
+        text = text.replace(tag, "." + (" " * (len(tag) - 1)))
     for tag in TAGS_IGNORE:
-        text = text.replace(tag, ' ' * len(tag))
+        text = text.replace(tag, " " * len(tag))
     return text
+
 
 def optimal_threshold(preds, int_labels) -> tuple[float, float, float, float]:
     """

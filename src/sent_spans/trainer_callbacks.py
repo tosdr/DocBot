@@ -18,10 +18,19 @@ the doc dataset, hence the callback.
 There's also one to eval against the training set.
 """
 
+
 class DocEvalCallback(TrainerCallback):
     def __init__(
-            self, doc_df: pd.DataFrame, case_id, sent_boundaries, tokenizer, save_to_dir: Callable,
-            eval_every=3, log_wandb=True, device='cuda', **kwargs
+        self,
+        doc_df: pd.DataFrame,
+        case_id,
+        sent_boundaries,
+        tokenizer,
+        save_to_dir: Callable,
+        eval_every=3,
+        log_wandb=True,
+        device="cuda",
+        **kwargs,
     ):
         super().__init__(**kwargs)
         self.doc_df = doc_df
@@ -35,11 +44,11 @@ class DocEvalCallback(TrainerCallback):
         self.device = device
         self.best_f1 = -1.0
 
-        self.acc_metric = load_metric('accuracy')
-        self.auc_metric = load_metric('roc_auc')
-        self.prec_metric = load_metric('precision')
-        self.rec_metric = load_metric('recall')
-        self.f1_metric = load_metric('f1')
+        self.acc_metric = load_metric("accuracy")
+        self.auc_metric = load_metric("roc_auc")
+        self.prec_metric = load_metric("precision")
+        self.rec_metric = load_metric("recall")
+        self.f1_metric = load_metric("f1")
 
     def on_evaluate(self, args, state, control, model, **kwargs):
         if self.eval_count % self.eval_every != 0:
@@ -50,21 +59,26 @@ class DocEvalCallback(TrainerCallback):
         doc_df = self.doc_df.copy()
         # For some reason this takes more memory than during training, so cut batch size in half
         doc_df = inference.attach_predictions(
-            doc_df, self.tokenizer, self.sent_boundaries, model,
-            batch_size=args.per_device_eval_batch_size // 2, device=self.device
+            doc_df,
+            self.tokenizer,
+            self.sent_boundaries,
+            model,
+            batch_size=args.per_device_eval_batch_size // 2,
+            device=self.device,
         )
 
         metrics = {
-            'doc/f1': self.f1_metric.compute(
-                predictions=doc_df.pred_label, references=doc_df.int_labels)['f1'],
-            'doc/prec': self.prec_metric.compute(
-                predictions=doc_df.pred_label, references=doc_df.int_labels)['precision'],
-            'doc/rec': self.rec_metric.compute(
-                predictions=doc_df.pred_label, references=doc_df.int_labels)['recall'],
-            'doc/accuracy': self.acc_metric.compute(
-                predictions=doc_df.pred_label, references=doc_df.int_labels)['accuracy'],
-            'doc/roc_auc': self.auc_metric.compute(
-                prediction_scores=doc_df.pred_score, references=doc_df.int_labels)['roc_auc'],
+            "doc/f1": self.f1_metric.compute(predictions=doc_df.pred_label, references=doc_df.int_labels)["f1"],
+            "doc/prec": self.prec_metric.compute(predictions=doc_df.pred_label, references=doc_df.int_labels)[
+                "precision"
+            ],
+            "doc/rec": self.rec_metric.compute(predictions=doc_df.pred_label, references=doc_df.int_labels)["recall"],
+            "doc/accuracy": self.acc_metric.compute(predictions=doc_df.pred_label, references=doc_df.int_labels)[
+                "accuracy"
+            ],
+            "doc/roc_auc": self.auc_metric.compute(prediction_scores=doc_df.pred_score, references=doc_df.int_labels)[
+                "roc_auc"
+            ],
         }
         for key, val in metrics.items():
             logger.info(f"\t{key}: {val:.4f}")
@@ -73,7 +87,7 @@ class DocEvalCallback(TrainerCallback):
 
         # Normally the Trainer class keeps track of the best model using its standard evaluation loop on the test
         # set. In our case we want to use the doc dataset to select the best model, so we'll keep track here.
-        f1 = metrics['doc/f1']
+        f1 = metrics["doc/f1"]
         if f1 > self.best_f1:
             self.best_f1 = f1
             save_dir = self.save_to_dir(self.case_id)
@@ -90,5 +104,5 @@ class EvalTrainingSetCallback(TrainerCallback):
 
     def on_evaluate(self, args, state, control, **kwargs):
         logger.info("======= Evaluating training subset =======")
-        output = self.trainer.predict(self.test_dataset, metric_key_prefix='train')
+        output = self.trainer.predict(self.test_dataset, metric_key_prefix="train")
         self.trainer.log(output.metrics)
