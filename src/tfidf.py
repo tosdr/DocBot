@@ -504,7 +504,7 @@ def prep_datasets(documents, points, services, num_negative_docs=600, sents_per_
     positives = dict()
     for case_id in CASE_IDS:
         approved = approved_points[approved_points.case_id == case_id].copy()
-        approved['text'] = approved['quoteText']
+        approved['text'] = approved.quote_text.apply(utils.preprocess_doc_text)
         approved['point_id'] = approved['id']
         positives[case_id] = approved[['point_id', 'case_id', 'quote_start', 'quote_end', 'document_id', 'text']]
 

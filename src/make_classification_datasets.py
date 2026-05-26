@@ -185,8 +185,10 @@ def _make_surrounding(approved_df, sample_window_size_fn, sent_boundaries, targe
                                            len(sent_boundaries[point.document_id]))
             surrounding.append(after_point)
     surrounding_df = pd.DataFrame(surrounding)
-    surrounding_df = surrounding_df.assign(label='negative', source='surrounding', point_id=np.nan,
-                                           status=np.nan, quoteText=np.nan, quote_start=np.nan, quote_end=np.nan)
+    surrounding_df = surrounding_df.assign(
+        label='negative', source='surrounding', point_id=np.nan, status=np.nan, quote_start=np.nan,
+        quote_end=np.nan
+    )
     surrounding_df = surrounding_df.drop('id', axis=1)
     return surrounding_df
 
@@ -225,8 +227,8 @@ def _make_random_reviewed(
             'sent_idx_end': int(sent_idx_start) + instance_num_sents,
         })
     return pd.DataFrame(reviewed_random).assign(
-        label='negative', source='reviewed_random', point_id=np.nan, status=np.nan,
-        quoteText=np.nan, quote_start=np.nan, quote_end=np.nan,
+        label='negative', source='reviewed_random', point_id=np.nan, status=np.nan, quote_start=np.nan,
+        quote_end=np.nan,
     )
 
 
@@ -259,8 +261,7 @@ def _make_random_from_approved(approved, instance_df, sample_window_size_fn, sen
                     existing_ranges.append([int(sent_idx_start), sent_idx_end])
                     break
     return pd.DataFrame(doc_random).assign(
-        label='negative', source='doc_random', point_id=np.nan, status=np.nan,
-        quoteText=np.nan, quote_start=np.nan, quote_end=np.nan,
+        label='negative', source='doc_random', point_id=np.nan, status=np.nan, quote_start=np.nan, quote_end=np.nan,
     )
 
 
@@ -283,8 +284,9 @@ def _make_topical(approved, cases, points, target_case):
     desired_num = 3 * len(approved)
     if len(topical) > desired_num:
         topical = topical.sample(desired_num, random_state=0)
-    topical = topical.assign(label='negative', source='topical', point_id=topical.id,
-                             status=np.nan, quoteText=np.nan, quote_start=np.nan, quote_end=np.nan)
+    topical = topical.assign(
+        label='negative', source='topical', point_id=topical.id, status=np.nan, quote_start=np.nan, quote_end=np.nan
+    )
     topical = topical.drop('id', axis=1)
     return topical
 
@@ -368,8 +370,11 @@ def _build_sent_span_case_dataset(
     logger.info(f"{len(topical)} topical points")
 
     # Random segments from the rest of approved docs. Pre-merge what we have so far so doc_random can
-    # avoid sentence spans already represented.
-    so_far = pd.concat([approved, declined, surrounding_df, topical])
+    # avoid sentence spans already represented. Pending points for the target case are included as
+    # exclusion-only ranges — they may be true evidence (e.g. unreviewed docbot predictions) so we
+    # don't want a doc_random window landing on them.
+    pending_exclude = points[(points.case_id == target_case.id) & (points.status == 'pending')]
+    so_far = pd.concat([approved, declined, surrounding_df, topical, pending_exclude])
     doc_random_df = _make_random_from_approved(
         approved, so_far, sample_window_size_fn, sent_boundaries, target_case
     )
@@ -479,26 +484,36 @@ def make_doc_datasets(
 
 
 def assign_folds(sent_span_datasets, doc_datasets):
-    # Make folds assigned by document id
-    # Ideally they'd be stratefied by sent span source, but I don't think there's a way to accomplish both
-    # Since we are training models per case, we can do the split separately per case
+    """
+    Folds are split by document_id so a doc can't leak between the sent-span and doc datasets. Within
+    that constraint, docs are bucketed into those that contribute any positive instance vs. those that
+    don't, and each bucket is sliced across folds independently — this stratifies positives so each
+    fold gets a representative share (positives are rare for many cases, and uniform doc-ID shuffling
+    leaves cross-fold variance high).
+    """
     def _gen_fold_slice(n, fold_i):
         return slice(round(fold_i * (n / NUM_FOLDS)), round((fold_i+1) * (n / NUM_FOLDS)))
 
     rng = random.Random(0)
     for case_id in set(sent_span_datasets.keys()).union(set(doc_datasets.keys())):
-        doc_ids = set()
-        if case_id in sent_span_datasets:
-            doc_ids = doc_ids.union(set(sent_span_datasets[case_id].document_id))
-        if case_id in doc_datasets:
-            doc_ids = doc_ids.union(set(doc_datasets[case_id].id_doc))
-        doc_ids = list(doc_ids)
-        rng.shuffle(doc_ids)
         sent_df = sent_span_datasets[case_id]
         doc_df = doc_datasets[case_id]
-        for fold_i, fold_doc_ids in enumerate([doc_ids[_gen_fold_slice(len(doc_ids), i)] for i in range(NUM_FOLDS)]):
-            sent_df.loc[sent_df[sent_df.document_id.isin(set(fold_doc_ids))].index, 'fold'] = fold_i
-            doc_df.loc[doc_df[doc_df.id_doc.isin(set(fold_doc_ids))].index, 'fold'] = fold_i
+
+        positive_doc_ids = set(sent_df.loc[sent_df.label == 'positive', 'document_id'])\
+            .union(set(doc_df.loc[doc_df.label == 'positive', 'id_doc']))
+        all_doc_ids = set(sent_df.document_id).union(set(doc_df.id_doc))
+        negative_only_doc_ids = all_doc_ids - positive_doc_ids
+
+        positive_doc_ids = list(positive_doc_ids)
+        negative_only_doc_ids = list(negative_only_doc_ids)
+        rng.shuffle(positive_doc_ids)
+        rng.shuffle(negative_only_doc_ids)
+
+        for fold_i in range(NUM_FOLDS):
+            fold_doc_ids = set(positive_doc_ids[_gen_fold_slice(len(positive_doc_ids), fold_i)]) \
+                | set(negative_only_doc_ids[_gen_fold_slice(len(negative_only_doc_ids), fold_i)])
+            sent_df.loc[sent_df.document_id.isin(fold_doc_ids), 'fold'] = fold_i
+            doc_df.loc[doc_df.id_doc.isin(fold_doc_ids), 'fold'] = fold_i
         sent_df.fold = sent_df.fold.astype(int)
         doc_df.fold = doc_df.fold.astype(int)
         for fold_i in range(NUM_FOLDS):
@@ -521,6 +536,9 @@ def run():
     services = pd.read_pickle(here / f'../data/db_dumps/{DB_DUMP_VERSION}/services_clean.pkl')
     versions = pd.read_pickle(here / f'../data/db_dumps/{DB_DUMP_VERSIONS_VERSION}/versions.pkl')
 
+    # Drop points not associated with a doc
+    points = points[points.document_id.notna()]
+
     # Join service info onto documents, avoiding duplicate columns
     documents = pd.merge(
         documents.drop(['id_service', 'name_service'], axis=1),
@@ -535,7 +553,7 @@ def run():
     )
     # Clean up html, which is necessary for good sentence splitting. This should be done for inference as well.
     documents['text'] = documents.text.apply(utils.preprocess_doc_text)
-    points['text'] = points.text.apply(utils.preprocess_doc_text)
+    points['text'] = points.quote_text.apply(lambda text: None if pd.isna(text) else utils.preprocess_doc_text(text))
     # type coercion
     points['document_id'] = points.document_id.astype(np.int64)
 

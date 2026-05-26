@@ -104,7 +104,7 @@ def finetune(
     # To make logs quieter
     input_cases = input_cases.drop(
         ['service_id', 'quote_start', 'char_end', 'status', 'point_id', 'quote_end', 'source', 'sent_idx_start',
-         'sent_idx_end', 'quoteText', 'case_id', 'char_start', 'document_id', 'num_sents', 'lang', 'title'], axis=1)
+         'sent_idx_end', 'quote_text', 'case_id', 'char_start', 'document_id', 'num_sents', 'lang', 'title'], axis=1)
     input_cases['label'] = (input_cases.label == 'positive').astype(int)
 
     dataset = Dataset.from_pandas(input_cases)
@@ -318,7 +318,7 @@ def check_uploadable(upload_key, case_id):
     s3_client = boto3.client('s3', region_name=train_push.AWS_REGION)
     s3_sents_obj_name = f"{upload_key}/{case_id}/{case_id}_sents.pkl"
     try:
-        response = s3_client.head_object(Bucket=RESULTS_S3_BUCKET, Key=s3_sents_obj_name)
+        s3_client.head_object(Bucket=RESULTS_S3_BUCKET, Key=s3_sents_obj_name)
         raise Exception(f"S3 result object already exists: {s3_sents_obj_name}")
     except botocore.exceptions.ClientError as e:
         if e.response['Error']['Code'] == '404':

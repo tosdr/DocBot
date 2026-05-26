@@ -22,7 +22,7 @@ DetectorFactory.seed = 0
 # Trigger langdetect initialization once in the main thread (helps when doing inference in parallel)
 try:
     langdetect.detect("")
-except:
+except Exception:
     pass
 
 MAX_EXPANSION_SENTENCES = 3
