@@ -3,9 +3,9 @@ import collections
 import hashlib
 import itertools
 import logging
-from pathlib import Path
 import pickle
 import random
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -147,9 +147,9 @@ def _stretch_points(points: pd.DataFrame, sent_boundaries):
             points.at[point_i, "sent_idx_end"] = sent_idx_end
             assert sent_idx_end - sent_idx_start > 0
             points.at[point_i, "num_sents"] = sent_idx_end - sent_idx_start
-    points.sent_idx_start = points.sent_idx_start.astype(int)
-    points.sent_idx_end = points.sent_idx_end.astype(int)
-    points.num_sents = points.num_sents.astype(int)
+    points['sent_idx_start'] = points.sent_idx_start.astype(int)
+    points['sent_idx_end'] = points.sent_idx_end.astype(int)
+    points['num_sents'] = points.num_sents.astype(int)
     return points
 
 
@@ -194,9 +194,9 @@ def _make_surrounding(approved_df, sample_window_size_fn, sent_boundaries, targe
             surrounding.append(after_point)
     surrounding_df = pd.DataFrame(surrounding)
     surrounding_df = surrounding_df.assign(
-        label="negative", source="surrounding", point_id=np.nan, status=np.nan, quote_start=np.nan, quote_end=np.nan
+        label="negative", source="surrounding", point_id=np.nan, status=np.nan, quote_start=np.nan, quote_end=np.nan,
+        quote_text=np.nan
     )
-    surrounding_df = surrounding_df.drop("id", axis=1)
     return surrounding_df
 
 
@@ -234,7 +234,8 @@ def _make_random_reviewed(
             }
         )
     return pd.DataFrame(reviewed_random).assign(
-        label="negative", source="reviewed_random", point_id=np.nan, status=np.nan, quote_start=np.nan, quote_end=np.nan
+        label="negative", source="reviewed_random", point_id=np.nan, status=np.nan, quote_start=np.nan,
+        quote_end=np.nan, quote_text=np.nan
     )
 
 
@@ -272,7 +273,8 @@ def _make_random_from_approved(approved, instance_df, sample_window_size_fn, sen
                     existing_ranges.append([int(sent_idx_start), sent_idx_end])
                     break
     return pd.DataFrame(doc_random).assign(
-        label="negative", source="doc_random", point_id=np.nan, status=np.nan, quote_start=np.nan, quote_end=np.nan
+        label="negative", source="doc_random", point_id=np.nan, status=np.nan, quote_start=np.nan, quote_end=np.nan,
+        quote_text=np.nan
     )
 
 
@@ -299,7 +301,8 @@ def _make_topical(approved, cases, points, target_case):
     if len(topical) > desired_num:
         topical = topical.sample(desired_num, random_state=0)
     topical = topical.assign(
-        label="negative", source="topical", point_id=topical.id, status=np.nan, quote_start=np.nan, quote_end=np.nan
+        label="negative", source="topical", point_id=topical.id, status=np.nan, quote_start=np.nan, quote_end=np.nan,
+        quote_text=np.nan
     )
     topical = topical.drop("id", axis=1)
     return topical

@@ -1,21 +1,23 @@
 import copy
 import logging
-from pathlib import Path
 import pickle
 import random
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any, TypedDict
 
 import numpy as np
 import pandas as pd
+import spacy
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression, SGDClassifier
-from sklearn.metrics import precision_recall_curve, average_precision_score, confusion_matrix
+from sklearn.metrics import average_precision_score, confusion_matrix, precision_recall_curve
 from sklearn.model_selection import StratifiedKFold
-import spacy
-from textacy.representations.vectorizers import Vectorizer
 from textacy import extract
+from textacy.representations.vectorizers import Vectorizer
 from tqdm import tqdm
 
-from src import utils, inference
+from src import inference, utils
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,7 +30,7 @@ RANDOM_STATE = 0
 random.seed(RANDOM_STATE)
 
 # When updating, be sure to modify .dockerignore so the models are copied into the inference Docker image
-MODEL_VERSION = "tfidf_v1"
+MODEL_VERSION = "tfidf_v2"
 
 """
 This script trains high recall TF-IDF classification models that can be used as prefilters, to avoid unnecessary 
@@ -106,7 +108,7 @@ def summarize_metrics(metrics: dict, cv_folds: int, critical_recalls: list[float
             ...
     """
     # Step 1: Organize threshold_metrics by fold
-    all_recall_filterrates = [[] for _ in range(cv_folds)]
+    all_recall_filterrates: list[list[tuple[float, float, float]]] = [[] for _ in range(cv_folds)]
     for threshold_option in metrics["threshold_metrics"]:
         fold_idx = threshold_option["fold"]
         all_recall_filterrates[fold_idx].append(
@@ -114,12 +116,12 @@ def summarize_metrics(metrics: dict, cv_folds: int, critical_recalls: list[float
         )
 
     # Step 2: Sort each fold's options by recall (ascending)
-    all_recall_filterrates = [list(sorted(options, key=lambda m: m[0])) for options in all_recall_filterrates]
+    sorted_filterrates = [sorted(options, key=lambda m: m[0]) for options in all_recall_filterrates]
 
     # Step 3: For each critical recall, find best point per fold
     critical_folds = {recall: [] for recall in critical_recalls}
     for recall in critical_recalls:
-        for fold_options in all_recall_filterrates:
+        for fold_options in sorted_filterrates:
             # Find first option that meets or exceeds target recall
             for option in fold_options:
                 if option[0] >= recall:
@@ -189,12 +191,19 @@ def summarize_all_metrics(cv_results: list[dict], critical_recalls: list[float],
     return pd.DataFrame(res_df)
 
 
-def gen_setups():
+class Setup(TypedDict):
+    model_class: type[Any]
+    model_kwargs: dict[str, Any]
+    rebalance_to: int | None
+
+
+def gen_setups() -> Iterator[Setup]:
     # TODO also loop through the dataset labels (one with other topical positives, one without)
     for model_class, model_kwargs in [
-        # saga solver is good for sparse data
-        (LogisticRegression, dict(penalty="l2", max_iter=5000, solver="saga")),
-        (LogisticRegression, dict(penalty="elasticnet", l1_ratio=0.5, max_iter=5000, solver="saga")),
+        # saga solver is good for sparse data. l1_ratio=0 is pure L2, l1_ratio=0.5 is elasticnet
+        # (penalty= was deprecated in sklearn 1.8 in favor of l1_ratio/C)
+        (LogisticRegression, dict(l1_ratio=0, max_iter=5000, solver="saga")),
+        (LogisticRegression, dict(l1_ratio=0.5, max_iter=5000, solver="saga")),
         (SGDClassifier, dict(loss="log_loss", penalty="l2", alpha=0.0001, max_iter=5000)),
         # There was no clear winner for optimal regularization params, just try a bunch
         (
@@ -223,18 +232,18 @@ def gen_setups():
         # TODO try GradientBoostingClassifier if it's not overkill
     ]:
         for rebalance_to in [20, None]:
-            setup = {"model_class": model_class, "model_kwargs": model_kwargs, "rebalance_to": rebalance_to}
+            setup: Setup = {"model_class": model_class, "model_kwargs": model_kwargs, "rebalance_to": rebalance_to}
             if model_class.__name__ == "ComplementNB":
                 yield setup
             else:
-                setup["random_state"] = RANDOM_STATE
                 if model_class.__name__ == "RandomForestClassifier":
                     weight_options = ["balanced_subsample"]
                 else:
                     weight_options = [{0: 2.0, 1: 1.0}, {0: 1.0, 1: 1.0}, {0: 1.0, 1: 3.0}, {0: 1.0, 1: 5.0}]
                 for class_weight in weight_options:
-                    new_setup = copy.deepcopy(setup)
+                    new_setup: Setup = copy.deepcopy(setup)
                     new_setup["model_kwargs"]["class_weight"] = class_weight
+                    new_setup["model_kwargs"]["random_state"] = RANDOM_STATE
                     yield new_setup
 
 
@@ -283,7 +292,7 @@ def train_cv(
     logger.info(f"Vectorized shape {sentence_vectors.shape}")
     skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=RANDOM_STATE)
 
-    results = []
+    results: list[dict] = []
     setups = list(gen_setups())
     for setup_dict in tqdm(setups, desc="Trying setups"):
         metrics = {"avg_precisions": [], "threshold_metrics": []}
@@ -293,20 +302,21 @@ def train_cv(
             X_train, X_val = sentence_vectors[train_idx], sentence_vectors[val_idx]
             y_train, y_val = sentence_labels[train_idx], sentence_labels[val_idx]
 
-            if setup_dict["rebalance_to"] is not None:
+            rebalance_to = setup_dict["rebalance_to"]
+            if rebalance_to is not None:
                 pos_idx = np.where(y_train == 1)[0]
                 neg_idx = np.where(y_train == 0)[0]
 
                 # Keep all positives, sample negatives at desired ratio
                 # For 1:150 imbalance, might want 1:10 or 1:20 for training
-                target_ratio = min(setup_dict["rebalance_to"], len(neg_idx) // len(pos_idx))
+                target_ratio = min(rebalance_to, len(neg_idx) // len(pos_idx))
                 neg_sample_size = int(len(pos_idx) * target_ratio)
 
                 neg_sample_idx = np.random.choice(neg_idx, size=neg_sample_size, replace=False)
                 balanced_idx = np.concatenate([pos_idx, neg_sample_idx])
                 np.random.shuffle(balanced_idx)
 
-                X_train = X_train[balanced_idx]
+                X_train = X_train[balanced_idx]  # pyrefly: ignore[bad-index]  # scipy sparse stub lacks __getitem__
                 y_train = y_train[balanced_idx]
                 logger.debug(
                     f"Rebalanced training: {len(pos_idx)} pos, {len(neg_sample_idx)} neg (1:{target_ratio} ratio)"
@@ -352,7 +362,7 @@ def train_cv(
             # dev of CV fold thresholds
             metrics["avg_precisions"].append(average_precision_score(y_val, y_proba))
 
-        results.append(copy.copy(setup_dict) | {"metrics": metrics})
+        results.append({**setup_dict, "metrics": metrics})
         pickle.dump(results, open(results_filepath.as_posix(), "wb"))
 
     pickle.dump(results, open(results_filepath.as_posix(), "wb"))
@@ -490,6 +500,7 @@ def prep_datasets(
     """
     documents = documents[documents.lang == "en"]
     points = points[points.lang == "en"].copy()
+    points = points[points.quote_start.notna()]
 
     # Join service info onto documents (we'll use is_comprehensively_reviewed), attach num points
     documents = pd.merge(documents, services, left_on="service_id", right_index=True, suffixes=["_doc", "_service"])
@@ -497,7 +508,7 @@ def prep_datasets(
 
     # Filter out docs without enough points
     point_counts = points.document_id.value_counts()
-    documents.at[point_counts.index, "num_points"] = point_counts
+    documents.loc[point_counts.index, "num_points"] = point_counts
     # documents = documents[documents.index.isin(points.document_id)]
     documents = documents[(documents.is_comprehensively_reviewed) & (documents.num_points >= 8)]
 
@@ -599,7 +610,7 @@ def run():
     critical_recalls = [1.0, 0.98, 0.95]
 
     # Loop over all cases
-    for case_id in CASE_IDS:
+    for case_id in CASE_IDS[:3]:
         logger.info(f"Processing case {case_id}")
 
         # Create dataset for this case

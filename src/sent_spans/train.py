@@ -1,34 +1,36 @@
 import contextlib
-import random
-from argparse import ArgumentParser
 import io
 import logging
-from pathlib import Path
 import pickle
+import random
 import shutil
 import socket
 import time
+from argparse import ArgumentParser
+from pathlib import Path
+from typing import cast
 
 import boto3
 import botocore
-from datasets import load_metric, Dataset
+import evaluate
 import numpy as np
 import pandas as pd
-from peft import PeftModel, get_peft_model, LoraConfig, TaskType
-from sklearn.metrics import f1_score
 import spacy
+from datasets import Dataset
+from peft import LoraConfig, PeftModel, TaskType, get_peft_model
+from sklearn.metrics import f1_score
 from tqdm import tqdm
 from transformers import (
-    AutoTokenizer,
     AutoModelForSequenceClassification,
-    TrainingArguments,
-    Trainer,
+    AutoTokenizer,
     EarlyStoppingCallback,
+    Trainer,
+    TrainingArguments,
 )
-import wandb
 
-from src import make_classification_datasets, inference, utils
-from src.sent_spans import train_push, trainer_callbacks, TEST_CASE_IDS
+import wandb
+from src import inference, make_classification_datasets, utils
+from src.sent_spans import TEST_CASE_IDS, train_push, trainer_callbacks
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -113,6 +115,7 @@ def finetune(
         training_overrides = dict()
 
     tokenizer = AutoTokenizer.from_pretrained(model_base)
+    prefilter_kwargs = inference.load_prefilter_kwargs(case_id)
 
     def tokenize(examples):
         return tokenizer(examples["text"], padding="max_length", truncation=True)
@@ -147,14 +150,21 @@ def finetune(
     input_cases["label"] = (input_cases.label == "positive").astype(int)
 
     dataset = Dataset.from_pandas(input_cases)
-    tokenized = dataset.map(tokenize, batched=True)
+    # cast: Dataset.map is stubbed to return DatasetDict, but for a Dataset input it returns a Dataset
+    tokenized = cast(Dataset, dataset.map(tokenize, batched=True))
 
     if cv_folds is None:
         cv_folds = input_cases.fold.nunique()
     # CV logic depends on a reset index
     assert input_cases.index.values.tolist() == list(range(len(input_cases)))
 
-    doc_eval_kwargs = dict(tokenizer=tokenizer, sent_boundaries=doc_sent_boundaries, log_wandb=log_wandb, device=device)
+    doc_eval_kwargs = dict(
+        prefilter_kwargs=prefilter_kwargs,
+        tokenizer=tokenizer,
+        sent_boundaries=doc_sent_boundaries,
+        log_wandb=log_wandb,
+        device=device,
+    )
 
     sent_spans_df["pred"] = pd.Series(dtype=float)
     for fold_i in range(cv_folds):
@@ -201,6 +211,7 @@ def finetune(
                 shutil.copytree(best_model_loc_attempt(case_id), best_model_loc(case_id), dirs_exist_ok=True)
 
         # Turn the sentence span dataset's prediction activations into probabilities, save in `pred` column
+        assert best_pred is not None  # always set on the first attempt since pos_f1 >= 0 > best_metric's -1.0
         for i, n in enumerate(best_pred):
             softmax_probs = np.exp(n) / sum(np.exp(n))
             sent_spans_df.iloc[test_idxs[i], sent_spans_df.columns.get_loc("pred")] = softmax_probs[1]
@@ -208,6 +219,13 @@ def finetune(
         doc_df = doc_df.merge(best_pred_docs, "left")
 
     return sent_spans_df, doc_df
+
+
+def metric_value(metric, key, **kwargs):
+    """evaluate's compute() is typed as Optional[dict]; assert it's populated and return a single entry."""
+    result = metric.compute(**kwargs)
+    assert result is not None
+    return result[key]
 
 
 def finetune_fold(
@@ -232,13 +250,14 @@ def finetune_fold(
     if lora:
         lora_args = dict(r=16, lora_alpha=16, lora_dropout=0.1, bias="all")
         logger.info(f"Training Lora with args {lora_args}")
+        # pyrefly: ignore[bad-argument-type]  # bias literal is widened to str through **lora_args unpacking
         peft_config = LoraConfig(task_type=TaskType.SEQ_CLS, inference_mode=False, **lora_args)
         model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
 
     training_kwargs = dict(
-        output_dir=(here / f"../../data/models/{case_id}"),
-        evaluation_strategy="steps",
+        output_dir=(here / f"../../data/models/{case_id}").as_posix(),
+        eval_strategy="steps",
         save_strategy="steps",
         eval_steps=eval_steps,
         save_steps=eval_steps,
@@ -257,21 +276,21 @@ def finetune_fold(
     training_kwargs.update(training_overrides)
     training_args = TrainingArguments(**training_kwargs)
 
-    acc_metric = load_metric("accuracy")
-    auc_metric = load_metric("roc_auc")
-    prec_metric = load_metric("precision")
-    rec_metric = load_metric("recall")
-    f1_metric = load_metric("f1")
+    acc_metric = evaluate.load("accuracy")
+    auc_metric = evaluate.load("roc_auc")
+    prec_metric = evaluate.load("precision")
+    rec_metric = evaluate.load("recall")
+    f1_metric = evaluate.load("f1")
 
     def compute_metrics(eval_pred):
         logits, labels = eval_pred
         predictions = np.argmax(logits, axis=-1)
         return {
-            "f1_pos": f1_metric.compute(predictions=predictions, references=labels)["f1"],
-            "prec_pos": prec_metric.compute(predictions=predictions, references=labels)["precision"],
-            "rec_pos": rec_metric.compute(predictions=predictions, references=labels)["recall"],
-            "accuracy": acc_metric.compute(predictions=predictions, references=labels)["accuracy"],
-            "roc_auc": auc_metric.compute(prediction_scores=logits[:, 1], references=labels)["roc_auc"],
+            "f1_pos": metric_value(f1_metric, "f1", predictions=predictions, references=labels),
+            "prec_pos": metric_value(prec_metric, "precision", predictions=predictions, references=labels),
+            "rec_pos": metric_value(rec_metric, "recall", predictions=predictions, references=labels),
+            "accuracy": metric_value(acc_metric, "accuracy", predictions=predictions, references=labels),
+            "roc_auc": metric_value(auc_metric, "roc_auc", prediction_scores=logits[:, 1], references=labels),
         }
 
     # Doc evaluation takes a long time (it applies the model to every single sentence) so during the training loop
@@ -302,21 +321,18 @@ def finetune_fold(
     logger.info(f"****** Loading final best model from {best_dir}")
 
     if lora:
-        best_model = (
-            PeftModel.from_pretrained(
-                AutoModelForSequenceClassification.from_pretrained(model_base, num_labels=2), best_dir
-            )
-            .merge_and_unload()
-            .to(device)
-        )
+        base_model = AutoModelForSequenceClassification.from_pretrained(model_base, num_labels=2)
+        # pyrefly: ignore[not-callable]  # merge_and_unload is delegated via PeftModel.__getattr__
+        best_model = PeftModel.from_pretrained(base_model, best_dir).merge_and_unload()
+        best_model = best_model.to(device)
     else:
-        best_model = trainer.model.from_pretrained(best_dir).to(device)
+        best_model = AutoModelForSequenceClassification.from_pretrained(best_dir).to(device)
 
     # Doc dataset. F1 can later be used to pick the best one from multiple attempts
     test_doc_df = inference.attach_predictions(
         test_doc_df, **doc_eval_kwargs, model=best_model, batch_size=batch_size // 2
     )
-    f1 = f1_metric.compute(predictions=test_doc_df.pred_label, references=test_doc_df.int_labels)["f1"]
+    f1 = metric_value(f1_metric, "f1", predictions=test_doc_df.pred_label, references=test_doc_df.int_labels)
 
     # Sent span dataset. Might as well use the trainer.predict() API
     trainer.model = best_model
@@ -420,7 +436,7 @@ def train_serial(args, device, train_fold_kwargs, dataset_dict, doc_dataset_dict
     except FileNotFoundError:
         docs_pred_local = dict()
 
-    # For reproducability, a seed was set above for a consistent visitation order
+    # For reproducibility, a seed was set above for a consistent visitation order
     case_ids = list(dataset_dict.keys())
     random.shuffle(case_ids)
     for case_id in case_ids:
@@ -614,7 +630,7 @@ if __name__ == "__main__":
         args.early_stopping_patience = 2
         if args.parallel_key:
             logger.info("Testing SQS workflow")
-            train_push.push(dataset_dict.keys(), "debug")
+            train_push.push(list(dataset_dict.keys()), "debug")
 
     train_fold_kwargs = dict(
         batch_size=args.batch_size,

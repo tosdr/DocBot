@@ -1,9 +1,9 @@
-import backoff
 import json
 import logging
 import os
 import time
 
+import backoff
 import requests
 
 logging.basicConfig(level=logging.INFO)
@@ -51,8 +51,8 @@ class Client:
         is_private: bool,
         desc: str,
         allow_404: bool = False,
-        params: dict = None,
-        payload: dict = None,
+        params: dict | None = None,
+        payload: dict | None = None,
     ):
         if payload is None:
             payload = dict()
@@ -79,7 +79,7 @@ class Client:
         res = self._call("/document/v2", "get", False, "get all Doc IDs")
         return json.loads(res.text)["documents"]
 
-    def get_doc(self, doc_id) -> dict:
+    def get_doc(self, doc_id) -> dict | None:
         res = self._call(
             "/document/v2", "get", False, "GET doc by ID", allow_404=True, params={"id": _assert_int(doc_id)}
         )

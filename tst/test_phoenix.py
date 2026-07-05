@@ -15,6 +15,7 @@ def test_get_docs():
 def test_get_doc():
     client = phoenix.Client()
     doc = client.get_doc(DOC_ID)
+    assert doc is not None
     assert doc["id"] == DOC_ID
     assert len(doc["text"]) > 200
 
@@ -50,4 +51,16 @@ def test_get_records():
 
 def test_add_record():
     client = phoenix.Client()
-    client.add_docbot_record(CASE_ID, DOC_ID, "1", "1", 4, 23, 1.0)
+    client.add_docbot_records(
+        [
+            dict(
+                case_id=CASE_ID,
+                document_id=DOC_ID,
+                text_version="1",
+                docbot_version="1",
+                char_start=4,
+                char_end=23,
+                ml_score=1.0,
+            )
+        ]
+    )

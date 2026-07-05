@@ -74,6 +74,7 @@ def run_ad_hoc(text_file_paths: list, device="mps", batch_size=16):
 
         base_model = AutoModelForSequenceClassification.from_pretrained(inference.BASE_MODEL_NAME)
         # https://github.com/huggingface/peft/issues/217#issuecomment-1506224612
+        # pyrefly: ignore[not-callable]  # merge_and_unload is delegated via PeftModel.__getattr__
         model = PeftModel.from_pretrained(base_model, peft_path(case_id)).merge_and_unload()
         model = model.to(device)
         tokenizer = AutoTokenizer.from_pretrained(inference.BASE_MODEL_NAME)

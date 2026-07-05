@@ -9,9 +9,9 @@ Fixed parameters:
 - dont_post=True: Don't POST results to Phoenix
 """
 
-import pytest
 from unittest.mock import Mock, patch
 
+import pytest
 
 # Test case ID used across tests
 TEST_CASE_ID = 134
@@ -293,9 +293,9 @@ class TestRunCase:
         """
         from src import apply_docbot
 
-        doc1_id = "100"
-        doc2_id = "200"
-        doc3_id = "300"
+        doc1_id = 100
+        doc2_id = 200
+        doc3_id = 300
         doc_list = [(doc1_id, "1"), (doc2_id, "1"), (doc3_id, "1")]
 
         doc1 = make_doc(doc1_id, lang="en")

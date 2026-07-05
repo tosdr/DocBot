@@ -152,7 +152,14 @@ def load_peft_model(case_id, base_model, local_models):
         logger.info(f"Initializing PEFT adapter from {peft_model_loc}")
     else:
         # Each case could take a long time, so get new IAM Role credentials to be safe (12 hour limit)
-        s3_client = boto3.client("s3", **get_aws_creds(), config=BOTO_CONFIG)
+        creds = get_aws_creds()
+        s3_client = boto3.client(
+            "s3",
+            aws_access_key_id=creds["aws_access_key_id"],
+            aws_secret_access_key=creds["aws_secret_access_key"],
+            aws_session_token=creds["aws_session_token"],
+            config=BOTO_CONFIG,
+        )
 
         tmpdir = tempfile.TemporaryDirectory()
         logger.info(f"Pulling PEFT adapter from: s3://{MODEL_S3_BUCKET}/{MODEL_VERSION}/{case_id}/adapter_model.bin")
@@ -164,6 +171,7 @@ def load_peft_model(case_id, base_model, local_models):
 
     model = PeftModel.from_pretrained(base_model, peft_model_loc)
     # https://github.com/huggingface/peft/issues/217#issuecomment-1506224612
+    # pyrefly: ignore[not-callable]  # merge_and_unload is delegated via PeftModel.__getattr__
     return model.merge_and_unload()
 
 
@@ -190,6 +198,7 @@ def run_case(
     :param skip_point_check: Don't skip a case/doc pair if there is an existing point (used for local inference)
     :return:
     """
+    points = pd.DataFrame()
     if not skip_point_check:
         if local_data:
             local_points = pd.read_pickle(here / f"../data/db_dumps/{apply_local.LOCAL_DUMP_VERSION}/points.pkl")
@@ -465,7 +474,9 @@ def run_all_cases(
 
     phoenix_client = None if (local_data and dont_post) else phoenix.Client()
 
+    s3_client = None
     if not dont_post or not local_models:
+        # pyrefly: ignore[no-matching-overload]  # boto3 client overloads don't accept **dict unpacking
         s3_client = boto3.client("s3", **get_aws_creds(), config=BOTO_CONFIG)
 
     # Load a list of case IDs
@@ -494,8 +505,8 @@ def run_all_cases(
     total_result_counts = defaultdict(int)
     # Maps from case ID to status to count
     case_result_counts: dict[int, dict[str, int]] = dict()
-    # Maps from case ID to doc ID to score
-    case_result_scores: dict[int, dict[int, float]] = dict()
+    # Maps from case ID to doc ID to a score dict (score, best_start, best_end, filter_rate)
+    case_result_scores: dict[int, dict[int, dict]] = dict()
     timestamp_key = int(start_s)
     results_dir = get_results_dir(timestamp_key)
     results_dir.mkdir(exist_ok=True, parents=True)
@@ -533,6 +544,7 @@ def run_all_cases(
         # Serialize latest results in case of crash
         # Get new S3 credentials in case the 12 hour limit ran out
         if not dont_post or not local_models:
+            # pyrefly: ignore[no-matching-overload]  # boto3 client overloads don't accept **dict unpacking
             s3_client = boto3.client("s3", **get_aws_creds(), config=BOTO_CONFIG)
     save_results(case_result_scores, case_result_counts, results_dir, None if dont_post else s3_client, timestamp_key)
 

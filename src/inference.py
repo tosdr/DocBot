@@ -1,15 +1,15 @@
 import logging
-from pathlib import Path
 import pickle
+from pathlib import Path
 
 import langdetect
-from langdetect import DetectorFactory
-from langdetect.lang_detect_exception import LangDetectException
 import numpy as np
 import spacy
-from textacy import extract
 import torch
 import torch.nn.functional as f
+from langdetect import DetectorFactory
+from langdetect.lang_detect_exception import LangDetectException
+from textacy import extract
 from tqdm import tqdm
 
 from src import utils
@@ -178,7 +178,7 @@ def test_gpu_memory(batch_size, model, device, model_max_length):
 
 
 def load_prefilter_kwargs(case_id):
-    from tfidf import model_output_dir
+    from src.tfidf import model_output_dir
 
     prefilter_dir = model_output_dir(case_id)
     return {
@@ -229,7 +229,7 @@ def apply_sent_span_model(
     hf_model,
     batch_size,
     device,
-    off_limits: list[tuple[int, int]] = None,
+    off_limits: list[tuple[int, int]] | None = None,
 ) -> None | tuple[float, int, int, int, float]:
     """
     Takes a model that was trained for text classification on sentence spans (usually 1 or 2, but potentially 5+)
@@ -249,7 +249,8 @@ def apply_sent_span_model(
     """
     if off_limits is None:
         off_limits = []
-    sent_boundaries = sent_boundaries + [None]
+    # Append an end-of-document sentinel so the last sentence slices to the end (text[start:len(text)] == text[start:])
+    sent_boundaries = sent_boundaries + [len(text)]
     num_sentences = len(sent_boundaries) - 1
 
     # Most of the sentences we can quickly disqualify by testing for key terms, via a TF-IDF classifier prefilter
@@ -264,7 +265,7 @@ def apply_sent_span_model(
             sent_start = sent_boundaries[i]
             sent_end = sent_boundaries[i + 1]
             # Check overlap: sentence overlaps with off_limits span if they intersect
-            if (sent_end is None or off_start < sent_end) and (off_end is None or sent_start < off_end):
+            if off_start < sent_end and (off_end is None or sent_start < off_end):
                 user_mask[i] = True
 
     # Combine prefilter mask with user-provided off_limits
@@ -289,7 +290,7 @@ def apply_sent_span_model(
         softmax_probs += f.softmax(preds.logits, dim=1)[:, 1].tolist()
     softmax_probs = np.array(softmax_probs)
     best_score = softmax_probs.max()
-    best_sent_idx = valid_sent_indices[softmax_probs.argmax()]
+    best_sent_idx = int(valid_sent_indices[softmax_probs.argmax()])
 
     # We'll now try extending the best scoring span up to 5 sentences to the left and right, looking for a higher score.
 
@@ -313,9 +314,9 @@ def apply_sent_span_model(
         best_score_with_priors = softmax_probs.max()
         if best_score_with_priors > best_score:
             best_score = best_score_with_priors
-            num_prior = softmax_probs.argmax() + 1
+            num_prior = int(softmax_probs.argmax()) + 1
 
-    # Example: sent_boundaries are [0, 5, 10, 15, 20, None] and best_sent_idx is 2 (chars 10-15). There should only
+    # Example: sent_boundaries are [0, 5, 10, 15, 20, len(text)] and best_sent_idx is 2 (chars 10-15). There should only
     # be two more sentences to potentially add at the end, 15-20 and 20-end. So we can't go beyond len(sent_boundaries) - (best + 2)
     after_sents_considered = min(MAX_EXPANSION_SENTENCES, len(sent_boundaries) - (best_sent_idx + 2))
     num_after = 0
@@ -339,7 +340,7 @@ def apply_sent_span_model(
         best_score_with_afters = softmax_probs.max()
         if best_score_with_afters > best_score:
             best_score = best_score_with_afters
-            num_after = softmax_probs.argmax() + 1
+            num_after = int(softmax_probs.argmax()) + 1
 
     # Return winning score, char span, how many sentences it spans, and the prefilter filter rate
     return (
@@ -351,7 +352,7 @@ def apply_sent_span_model(
     )
 
 
-def attach_predictions(doc_df, tokenizer, sent_boundaries, model, batch_size=4, device="cpu"):
+def attach_predictions(doc_df, prefilter_kwargs, tokenizer, sent_boundaries, model, batch_size=4, device="cpu"):
     """
     Supports evaluation during train.py
     Instead of selecting the class with a higher logit, this gathers post-softmax probabilities and
@@ -360,7 +361,13 @@ def attach_predictions(doc_df, tokenizer, sent_boundaries, model, batch_size=4, 
     doc_df = doc_df.copy()
     for idx, instance in tqdm(doc_df.iterrows(), total=len(doc_df), desc=f"Applying model to docs on {device}"):
         ret = apply_sent_span_model(
-            instance.text, sent_boundaries[instance.id_doc], tokenizer, model, batch_size=batch_size, device=device
+            instance.text,
+            sent_boundaries[instance.id_doc],
+            prefilter_kwargs,
+            tokenizer,
+            model,
+            batch_size=batch_size,
+            device=device,
         )
         if ret is not None:
             score, start, end, num_sents, filter_rate = ret
