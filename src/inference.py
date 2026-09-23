@@ -1,3 +1,4 @@
+import json
 import logging
 import pickle
 from pathlib import Path
@@ -34,7 +35,13 @@ BASE_MODEL_NAME = "bert-base-uncased"
 # docbot has already ran docs, so if we train a new model and want to rerun, this should be updated.
 MODEL_VERSION = "v3"
 
-# Case-specific positive prediction thresholds. These come from pr_curves.ipynb, and optimize fscore with beta=1.5
+# The operating point apply_docbot uses from each case's thresholds.json menu (see sent_spans/thresholds.py).
+# Other consumers (e.g. auto-approval) can request a precision tier like "precision90" instead.
+DEFAULT_OPERATING_POINT = "fbeta15"
+
+# DEPRECATED: case-specific thresholds for v3 models, which predate the per-case thresholds.json artifacts.
+# get_threshold() falls back to this dict when no artifact exists; delete it once MODEL_VERSION moves past v3.
+# These come from the old pr_curves.ipynb flow, and optimize fscore with beta=1.5
 THRESHOLDS = {
     117: 0.9313029646873474,
     118: 0.9996505975723267,
@@ -162,6 +169,54 @@ THRESHOLDS = {
 }
 
 
+def model_dir(case_id, version: str = MODEL_VERSION) -> Path:
+    """Local directory holding a case's model artifacts (PEFT adapter, thresholds.json) for a model version.
+    Defaults to the production version; pass `version` explicitly when preparing the next release
+    (e.g. thresholds.py writing thresholds.json for models that haven't shipped yet)."""
+    return here / f"../data/models/{version}/{case_id}"
+
+
+def get_threshold(case_id: int, operating_point: str = DEFAULT_OPERATING_POINT) -> float:
+    """
+    Returns the case's decision threshold for the requested operating point, from the thresholds.json menu
+    written by sent_spans/thresholds.py. Falls back to the legacy THRESHOLDS dict for model versions that
+    predate the artifacts (v3).
+    """
+    thresholds_path = model_dir(case_id) / "thresholds.json"
+    if not thresholds_path.exists():
+        if case_id in THRESHOLDS:
+            return THRESHOLDS[case_id]
+        raise KeyError(f"No thresholds.json at {thresholds_path} and no legacy threshold for case {case_id}")
+
+    with open(thresholds_path) as f:
+        artifact = json.load(f)
+    for op in artifact["operating_points"]:
+        if op["name"] == operating_point:
+            if not op["attainable"] or op["threshold"] is None:
+                raise ValueError(f"Case {case_id} operating point {operating_point} was not attainable in CV")
+            if not op["stable"]:
+                logger.warning(
+                    f"Case {case_id} operating point {operating_point} had unstable CV fold thresholds "
+                    f"(std_logit {op['std_logit']:.2f}); using the conservative fallback threshold"
+                )
+            return op["threshold"]
+    raise KeyError(f"Operating point {operating_point} not found in {thresholds_path}")
+
+
+def list_case_ids() -> list[int]:
+    """Cases with a production model, judged by the presence of a thresholds.json artifact. Falls back to the
+    legacy THRESHOLDS dict when none exist locally (v3 models)."""
+    models_root = here / f"../data/models/{MODEL_VERSION}"
+    case_ids = set()
+    if models_root.exists():
+        for path in models_root.iterdir():
+            if path.is_dir() and (path / "thresholds.json").exists():
+                case_ids.add(int(path.name))
+    if not case_ids:
+        case_ids = set(THRESHOLDS.keys())
+    return list(sorted(case_ids))
+
+
 def detect_lang(text: str):
     try:
         return langdetect.detect(text)
@@ -230,6 +285,7 @@ def apply_sent_span_model(
     batch_size,
     device,
     off_limits: list[tuple[int, int]] | None = None,
+    precomputed_prefilter: tuple[np.ndarray, float] | None = None,
 ) -> None | tuple[float, int, int, int, float]:
     """
     Takes a model that was trained for text classification on sentence spans (usually 1 or 2, but potentially 5+)
@@ -244,6 +300,10 @@ def apply_sent_span_model(
     Char spans can be marked as off limits with list[tuple(int, int)] off_limits. This is so that in production we can
     avoid re-suggesting a point that was declined by a curator.
 
+    The prefilter output only depends on the TF-IDF model and the doc text, not the BERT model, so callers that
+    apply several BERT models to the same doc (e.g. eval during training) can pass `precomputed_prefilter`
+    (the tuple returned by apply_prefilter) to skip re-running it.
+
     Returns the winning score, the winning char span, how many sentences it spans, and the prefilter filter rate.
     In rare cases returns None (only if the entire doc was marked as off_limits)
     """
@@ -254,8 +314,11 @@ def apply_sent_span_model(
     num_sentences = len(sent_boundaries) - 1
 
     # Most of the sentences we can quickly disqualify by testing for key terms, via a TF-IDF classifier prefilter
-    # TODO precompute / use doc cache for prefilter tokenization so they are shared between cases?
-    prefilter_mask, filter_rate = apply_prefilter(text, sent_boundaries, **prefilter_kwargs)
+    # TODO in production, share prefilter tokenization between cases?
+    if precomputed_prefilter is not None:
+        prefilter_mask, filter_rate = precomputed_prefilter
+    else:
+        prefilter_mask, filter_rate = apply_prefilter(text, sent_boundaries, **prefilter_kwargs)
     logger.debug(f"TF-IDF prefilter applied with filter rate {filter_rate:.2f}")
 
     # Convert user-provided off_limits spans to a sentence mask
@@ -352,22 +415,35 @@ def apply_sent_span_model(
     )
 
 
-def attach_predictions(doc_df, prefilter_kwargs, tokenizer, sent_boundaries, model, batch_size=4, device="cpu"):
+def attach_predictions(
+    doc_df, prefilter_kwargs, tokenizer, sent_boundaries, model, batch_size=4, device="cpu", prefilter_cache=None
+):
     """
     Supports evaluation during train.py
     Instead of selecting the class with a higher logit, this gathers post-softmax probabilities and
     uses whatever threshold optimizes F1 of the dataset
+
+    Since the prefilter doesn't depend on the BERT model, callers that evaluate repeatedly (e.g. the eval callbacks
+    during training) can pass a dict as `prefilter_cache`; masks are computed once per id_doc and reused.
     """
     doc_df = doc_df.copy()
     for idx, instance in tqdm(doc_df.iterrows(), total=len(doc_df), desc=f"Applying model to docs on {device}"):
+        boundaries = sent_boundaries[instance.id_doc]
+        prefilter = prefilter_cache.get(instance.id_doc) if prefilter_cache is not None else None
+        if prefilter is None:
+            # Match apply_sent_span_model, which appends an end-of-document sentinel before prefiltering
+            prefilter = apply_prefilter(instance.text, boundaries + [len(instance.text)], **prefilter_kwargs)
+            if prefilter_cache is not None:
+                prefilter_cache[instance.id_doc] = prefilter
         ret = apply_sent_span_model(
             instance.text,
-            sent_boundaries[instance.id_doc],
+            boundaries,
             prefilter_kwargs,
             tokenizer,
             model,
             batch_size=batch_size,
             device=device,
+            precomputed_prefilter=prefilter,
         )
         if ret is not None:
             score, start, end, num_sents, filter_rate = ret

@@ -1,55 +1,58 @@
-from argparse import ArgumentParser
+import io
 import logging
-import operator
-from pathlib import Path
 import pickle
 import re
+from argparse import ArgumentParser
 
 import boto3
+import pandas as pd
 import tqdm
 
-from src.sent_spans import train_push, train
-
+from src.sent_spans import RESULTS_S3_BUCKET, train, train_push
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-here = Path(__file__).parent
 
 
-def list_case_models_s3(s3_client, upload_key) -> list[int]:
+def list_case_results_s3(s3_client, model_version) -> list[int]:
+    """Case IDs with CV doc predictions under {model_version}/cv/ in S3"""
     case_ids = set()
-    list_result = s3_client.list_objects(Bucket=train.RESULTS_S3_BUCKET, Prefix=f"{upload_key}/")
-    for object_key in map(operator.itemgetter("Key"), list_result["Contents"]):
-        match = re.match(f"^{upload_key}/(\d+)/adapter_model.bin", object_key)
-        if match is not None:
-            case_ids.add(int(match.groups()[0]))
-    return list(sorted(case_ids))
+    paginator = s3_client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=RESULTS_S3_BUCKET, Prefix=f"{model_version}/cv/"):
+        for obj in page.get("Contents", []):
+            match = re.match(rf"^{model_version}/cv/(\d+)/\1_docs\.parquet$", obj["Key"])
+            if match is not None:
+                case_ids.add(int(match.groups()[0]))
+    return sorted(case_ids)
+
+
+def _download_parquet(s3_client, key) -> pd.DataFrame:
+    res = s3_client.get_object(Bucket=RESULTS_S3_BUCKET, Key=key)
+    return pd.read_parquet(io.BytesIO(res["Body"].read()))
 
 
 if __name__ == "__main__":
-    parser = ArgumentParser(description="Pull results from S3 after running train.py with a --upload_key")
-    parser.add_argument("--upload_key", type=str, required=True)
+    parser = ArgumentParser(
+        description="Pull CV results from S3 (uploaded by train.py --upload) and rebuild the local prediction "
+        "caches in data/training/{model_version}/cv/, e.g. to re-run threshold selection without re-training"
+    )
+    parser.add_argument("--model_version", type=str, required=True)
     args = parser.parse_args()
 
-    output_dir = here / f"../../data/results/{args.upload_key}"
+    output_dir = train.results_dir(args.model_version)
     output_dir.mkdir(parents=True, exist_ok=False)
 
     s3_client = boto3.client("s3", region_name=train_push.AWS_REGION)
-    case_ids = list_case_models_s3(s3_client, args.upload_key)
+    case_ids = list_case_results_s3(s3_client, args.model_version)
 
     sent_res = dict()
     doc_res = dict()
     for case_id in tqdm.tqdm(case_ids):
-        res = s3_client.get_object(
-            Bucket=train.RESULTS_S3_BUCKET, Key=f"{args.upload_key}/{case_id}/{case_id}_sents.pkl"
-        )
-        sent_res[case_id] = pickle.loads(res["Body"].read())
-        res = s3_client.get_object(
-            Bucket=train.RESULTS_S3_BUCKET, Key=f"{args.upload_key}/{case_id}/{case_id}_docs.pkl"
-        )
-        doc_res[case_id] = pickle.loads(res["Body"].read())
+        prefix = f"{args.model_version}/cv/{case_id}"
+        sent_res[case_id] = _download_parquet(s3_client, f"{prefix}/{case_id}_sents.parquet")
+        doc_res[case_id] = _download_parquet(s3_client, f"{prefix}/{case_id}_docs.parquet")
 
-    logger.info(f"Found {len(sent_res)} case results: {list(sorted(list(sent_res.keys())))}")
+    logger.info(f"Found {len(sent_res)} case results: {sorted(sent_res.keys())}")
 
     sent_out = output_dir / "sent_span_pred.pkl"
     logger.info(f"Writing to {sent_out}")

@@ -22,7 +22,7 @@ def parallel_queue_name():
     return f"https://sqs.us-east-1.amazonaws.com/{os.environ['AWS_ACCOUNT']}/tosdr-training.fifo"
 
 
-def push(case_ids: list, parallel_key: str, empty_assert_timeout=30):
+def push(case_ids: list, model_version: str, empty_assert_timeout=30):
     sqs_client = boto3.client("sqs", region_name=AWS_REGION)
 
     # Assert nothing is in the queue. We have to do this for a few minutes because messages can be delayed
@@ -46,7 +46,7 @@ def push(case_ids: list, parallel_key: str, empty_assert_timeout=30):
         # In order for multiple cases to be processed in parallel, we have to give them a different MessageGroupID
         # since this is a FIFO queue
         sqs_client.send_message(
-            QueueUrl=parallel_queue_name(), MessageBody=str(case_id), MessageGroupId=f"{parallel_key}/{case_id}"
+            QueueUrl=parallel_queue_name(), MessageBody=str(case_id), MessageGroupId=f"{model_version}/{case_id}"
         )
 
 
@@ -55,7 +55,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--all", action="store_true", help="Train all ~150 case models, instead of a smaller group for testing"
     )
-    parser.add_argument("--parallel_key", type=str, required=True)
+    parser.add_argument(
+        "--model_version",
+        type=str,
+        required=True,
+        help="Model version being prepared (e.g. v4); workers must run train.py --parallel with the same value",
+    )
     args = parser.parse_args()
 
     if args.all:
@@ -68,4 +73,4 @@ if __name__ == "__main__":
     random.seed(0)
     random.shuffle(case_ids)
 
-    push(case_ids, args.parallel_key)
+    push(case_ids, args.model_version)

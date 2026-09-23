@@ -1,5 +1,12 @@
 # syntax=docker/dockerfile:1
-FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-runtime
+# A plain Python base is all we need: torch and its CUDA 12.8 libraries are installed from uv.lock by `uv sync`,
+# so only the host driver matters. cu128 wheels cover Turing (sm_75) through Blackwell (sm_120) and run on host
+# drivers >= R525 -- but they dropped Volta, so avoid V100/Pascal hosts on vast.ai.
+#
+# IMPORTANT: build with `--platform linux/amd64` (vast.ai hosts are x86_64). The lockfile only resolves to
+# CUDA-enabled torch on x86_64 linux -- an arm64 build (e.g. on an Apple Silicon Mac without --platform) silently
+# gets CPU-only torch.
+FROM python:3.12-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1
 ENV UV_LINK_MODE=copy
@@ -16,11 +23,23 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 ENV PATH="/.venv/bin:$PATH"
 
-RUN python -m spacy download en_core_web_md
+# `spacy download` shells out to pip, which uv-created venvs don't include; install the model wheel directly
+RUN uv pip install --python /.venv/bin/python \
+    https://github.com/explosion/spacy-models/releases/download/en_core_web_md-3.8.0/en_core_web_md-3.8.0-py3-none-any.whl
+
+# Pre-bake Hugging Face download (base model) so fresh instances don't refetch them. Only the default --model_base
+ENV HF_HOME=/hf
+RUN python -c "from transformers import AutoModelForSequenceClassification, AutoTokenizer; \
+    AutoTokenizer.from_pretrained('bert-base-uncased'); \
+    AutoModelForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=2)"
 
 COPY . /.
 
 ENV PYTHONPATH=/
+
+# NOTE: --train_final expects data/models/best/{case_id}/thresholds.json (produced by thresholds.py from a prior
+# CV run). It is NOT baked into this image -- copy it onto the instance before final training.
+# Runtime env vars to set on the instance: WANDB_API_KEY, plus AWS credentials for S3 uploads / SQS parallel mode.
 
 # Using ENTRYPOINT allows us to pass args with `docker run`
 # ENTRYPOINT ["python", "/src/sent_spans/train.py"]

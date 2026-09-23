@@ -26,7 +26,12 @@ def list_case_models() -> set[int]:
             case_ids.add(int(dirname))
 
     # Make sure these have thresholds
-    missing_thresholds = case_ids - set(inference.THRESHOLDS.keys())
+    missing_thresholds = set()
+    for case_id in case_ids:
+        try:
+            inference.get_threshold(case_id)
+        except (KeyError, ValueError):
+            missing_thresholds.add(case_id)
     if len(missing_thresholds) > 0:
         raise RuntimeError(f"Classification threshold not found for {missing_thresholds}")
 
@@ -79,6 +84,7 @@ def run_ad_hoc(text_file_paths: list, device="mps", batch_size=16):
         model = model.to(device)
         tokenizer = AutoTokenizer.from_pretrained(inference.BASE_MODEL_NAME)
         prefilter_kwargs = inference.load_prefilter_kwargs(case_id)
+        threshold = inference.get_threshold(case_id)
 
         for filename, boundaries, text in zip(filenames, sent_boundaries, texts):
             ret = inference.apply_sent_span_model(
@@ -88,7 +94,7 @@ def run_ad_hoc(text_file_paths: list, device="mps", batch_size=16):
                 score, best_start, best_end, _, __ = ret
                 evidence_str = text[best_start:best_end]
 
-                if score >= inference.THRESHOLDS[case_id]:
+                if score >= threshold:
                     logger.info(f"{filename} scored {score:.3f} from {best_start}-{best_end} with:\n{evidence_str}")
 
 

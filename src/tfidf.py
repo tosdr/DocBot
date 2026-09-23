@@ -23,9 +23,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 here = Path(__file__).parent
 
-DB_DUMP_VERSION = "2026-01-28"
+DB_DUMP_VERSION = "2026-07-09"
 # We'll only train models for Cases that have deep learning models trained
-CASE_IDS = list(sorted(inference.THRESHOLDS.keys()))
+CASE_IDS = inference.list_case_ids()
 RANDOM_STATE = 0
 random.seed(RANDOM_STATE)
 
@@ -610,7 +610,7 @@ def run():
     critical_recalls = [1.0, 0.98, 0.95]
 
     # Loop over all cases
-    for case_id in CASE_IDS[:3]:
+    for case_id in CASE_IDS:
         logger.info(f"Processing case {case_id}")
 
         # Create dataset for this case

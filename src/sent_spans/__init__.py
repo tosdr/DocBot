@@ -1,4 +1,5 @@
-TEST_CASE_IDS = [232, 216, 289, 217, 210, 399, 146, 183, 134, 294, 147, 326, 148, 303]
+# The comprehensively reviewed services have been double-checked for coverage with these cases, making them
+# perfect for evaluation. The other cases will have more true negatives.
+TEST_CASE_IDS = [203, 288, 214, 377]
 
-# testing corrections
-# TEST_CASE_IDS = [118, 121, 130, 232, 216]
+RESULTS_S3_BUCKET = "tosdr-training"

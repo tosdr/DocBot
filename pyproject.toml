@@ -9,7 +9,6 @@ dependencies = [
     "boto3==1.*",
     "boto3-stubs~=1.42.96",
     "datasets>=4.8.5",
-    "evaluate>=0.4.6",
     "jupyter>=1.1.1",
     "langdetect>=1.0.9",
     "marimo>=0.23.13",

@@ -9,3 +9,13 @@ notebooks/blog.ipynb
 .vs/
 .run
 .claude
+
+# Secrets / local infra config
+.env
+.env.*
+*.pem
+*.key
+credentials
+credentials.*
+bootstrap-assume.json
+trust-with-expiry.json

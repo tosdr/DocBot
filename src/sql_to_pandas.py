@@ -10,7 +10,7 @@ here = Path(__file__).parent
 
 DB_URL = "postgresql+psycopg2://phoenix:@127.0.0.1:5432/phoenix"
 TABLES = {"cases", "documents", "points", "services", "topics", "versions"}
-VERSION = "2026-01-28"
+VERSION = "2026-07-09"
 DUMP_DIR = here / f"../data/db_dumps/{VERSION}"
 
 

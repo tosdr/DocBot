@@ -5,6 +5,7 @@ import itertools
 import logging
 import pickle
 import random
+from argparse import ArgumentParser
 from pathlib import Path
 
 import numpy as np
@@ -20,17 +21,20 @@ here = Path(__file__).parent
 
 MIN_APPROVED = 40  # Focus on cases with enough approved points to fine-tune and evaluate
 NUM_FOLDS = 5  # Pre-determined train-test splits for downstream ML
+# A doc needs this many approved points before we treat it as reviewed comprehensively enough to use as a negative.
+# Shared with sent_spans.thresholds.compute_case_prevalence so the prevalence denominator matches the `reviewed`
+# negatives that end up in the eval set.
+COMPREHENSIVE_THRESHOLD = 12
 
-DB_DUMP_VERSION = "2026-01-28"
-DB_DUMP_VERSIONS_VERSION = "2026-04-18"  # `versions` table was exported separately
-LATEST_VERSION = "v1"
+DB_DUMP_VERSION = "2026-07-09"
+LATEST_VERSION = "v1"  # v1: CV folds grouped by service (v0 grouped by document)
 
 # Outputs are saved here
 SENT_SPAN_LOC = here / f"../data/db_dumps/{DB_DUMP_VERSION}/sent_span_classification_{LATEST_VERSION}.pkl"
 DOC_LOC = here / f"../data/db_dumps/{DB_DUMP_VERSION}/doc_classification_{LATEST_VERSION}.pkl"
 
 """
-This module takes database dumps (cleaned up by explore.ipynb) and forms two binary text classification datasets
+This module takes database dumps (cleaned up by src/clean_data.py) and forms two binary text classification datasets
 for each case: 1) sentence spans that look similar to points, 2) documents
 We create both at the same time to ensure that we use the same pre-split folds for cross validation. This allows us 
 to compare full document classification approaches (e.g. sequence tagging) with those that work on sentence spans.
@@ -72,6 +76,34 @@ def load_docs() -> dict[int, pd.DataFrame]:
         return pickle.load(f)
 
 
+def load_clean_dumps() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Load the cleaned DB dumps (clean_data.py output), joining service info onto documents.
+    Shared by run() and sent_spans.thresholds.compute_case_prevalence so both see the same document/point universe
+    (e.g. the is_comprehensively_reviewed flag, which lives on services).
+    :return: (cases, documents, points); documents carry service columns and keep their doc-id index.
+    """
+    dump_dir = here / f"../data/db_dumps/{DB_DUMP_VERSION}"
+    cases = pd.read_pickle(dump_dir / "cases_clean.pkl")
+    documents = pd.read_pickle(dump_dir / "documents_clean.pkl")
+    points = pd.read_pickle(dump_dir / "points_clean.pkl")
+    services = pd.read_pickle(dump_dir / "services_clean.pkl")
+
+    # Drop points not associated with a doc
+    points = points[points.document_id.notna()]
+
+    # Join service info onto documents, avoiding duplicate columns
+    documents = pd.merge(
+        documents.drop(["id_service", "name_service"], axis=1),
+        services,
+        left_on="service_id",
+        right_index=True,
+        suffixes=["_doc", "_service"],
+    )
+    # type coercion
+    points["document_id"] = points.document_id.astype(np.int64)
+    return cases, documents, points
+
+
 def _load_pending_not_found(versions: pd.DataFrame, points: pd.DataFrame) -> dict[int, set[int]]:
     """
     :param versions: db table tracking point changes
@@ -92,9 +124,11 @@ def _load_pending_not_found(versions: pd.DataFrame, points: pd.DataFrame) -> dic
     return point_ids
 
 
-def _get_sent_boundaries(documents) -> dict[int, list[int]]:
+def get_sent_boundaries(documents) -> dict[int, list[int]]:
     """
     Sentence splitting strategy was worked out in sent_splitting_benchmarks.py
+    Shared with sent_spans.train, which needs the same boundaries (and content-hashed cache) at training time.
+    :param documents: DataFrame with id_doc and text columns
     :return: dict from doc id to list of char positions that start sentences
     """
     # Hash on (id_doc, text) so the cache invalidates if doc content changes
@@ -147,9 +181,9 @@ def _stretch_points(points: pd.DataFrame, sent_boundaries):
             points.at[point_i, "sent_idx_end"] = sent_idx_end
             assert sent_idx_end - sent_idx_start > 0
             points.at[point_i, "num_sents"] = sent_idx_end - sent_idx_start
-    points['sent_idx_start'] = points.sent_idx_start.astype(int)
-    points['sent_idx_end'] = points.sent_idx_end.astype(int)
-    points['num_sents'] = points.num_sents.astype(int)
+    points["sent_idx_start"] = points.sent_idx_start.astype(int)
+    points["sent_idx_end"] = points.sent_idx_end.astype(int)
+    points["num_sents"] = points.num_sents.astype(int)
     return points
 
 
@@ -194,8 +228,13 @@ def _make_surrounding(approved_df, sample_window_size_fn, sent_boundaries, targe
             surrounding.append(after_point)
     surrounding_df = pd.DataFrame(surrounding)
     surrounding_df = surrounding_df.assign(
-        label="negative", source="surrounding", point_id=np.nan, status=np.nan, quote_start=np.nan, quote_end=np.nan,
-        quote_text=np.nan
+        label="negative",
+        source="surrounding",
+        point_id=np.nan,
+        status=np.nan,
+        quote_start=np.nan,
+        quote_end=np.nan,
+        quote_text=np.nan,
     )
     return surrounding_df
 
@@ -234,8 +273,13 @@ def _make_random_reviewed(
             }
         )
     return pd.DataFrame(reviewed_random).assign(
-        label="negative", source="reviewed_random", point_id=np.nan, status=np.nan, quote_start=np.nan,
-        quote_end=np.nan, quote_text=np.nan
+        label="negative",
+        source="reviewed_random",
+        point_id=np.nan,
+        status=np.nan,
+        quote_start=np.nan,
+        quote_end=np.nan,
+        quote_text=np.nan,
     )
 
 
@@ -273,8 +317,13 @@ def _make_random_from_approved(approved, instance_df, sample_window_size_fn, sen
                     existing_ranges.append([int(sent_idx_start), sent_idx_end])
                     break
     return pd.DataFrame(doc_random).assign(
-        label="negative", source="doc_random", point_id=np.nan, status=np.nan, quote_start=np.nan, quote_end=np.nan,
-        quote_text=np.nan
+        label="negative",
+        source="doc_random",
+        point_id=np.nan,
+        status=np.nan,
+        quote_start=np.nan,
+        quote_end=np.nan,
+        quote_text=np.nan,
     )
 
 
@@ -301,11 +350,29 @@ def _make_topical(approved, cases, points, target_case):
     if len(topical) > desired_num:
         topical = topical.sample(desired_num, random_state=0)
     topical = topical.assign(
-        label="negative", source="topical", point_id=topical.id, status=np.nan, quote_start=np.nan, quote_end=np.nan,
-        quote_text=np.nan
+        label="negative",
+        source="topical",
+        point_id=topical.id,
+        status=np.nan,
+        quote_start=np.nan,
+        quote_end=np.nan,
+        quote_text=np.nan,
     )
     topical = topical.drop("id", axis=1)
     return topical
+
+
+def quoted_approved_case_counts(points) -> pd.Series:
+    """Per-case number of approved points that have a quote, indexed by case id.
+
+    This is the single definition of a case's "size" used to pick which cases we model
+    (``num_approved >= MIN_APPROVED``), shared by the sent-span dataset, the doc dataset, and the
+    threshold/prevalence code so all three cover exactly the same set of cases. Points without a quote are
+    excluded because the sent-span trainer can only learn from a quoted span, so an unquoted approved point
+    doesn't make a case trainable. Assumes ``points`` is already language-filtered by the caller.
+    """
+    quoted_approved = points[(points.status == "approved") & points.quote_start.notna()]
+    return quoted_approved.case_id.value_counts()
 
 
 def make_sent_span_datasets(
@@ -321,6 +388,7 @@ def make_sent_span_datasets(
             `label` is `positive` or `negative`
             `source` is one of ['approved', 'declined', 'surrounding', 'topical', 'random']
     """
+    cases = cases.copy()  # num_approved is attached below; don't mutate the caller's frame
     if en_only:
         documents = documents[documents.lang == "en"].copy()
         points = points[points.lang == "en"].copy()
@@ -328,16 +396,14 @@ def make_sent_span_datasets(
     logger.info(f"Dropping {no_quote.sum()} points with no quote start/end")
     points = points[~no_quote]
 
-    point_counts = points[points.status == "approved"].case_id.value_counts()
-    cases.loc[point_counts.index, "num_approved"] = point_counts
+    case_counts = quoted_approved_case_counts(points)
+    cases.loc[case_counts.index, "num_approved"] = case_counts
     point_counts = points[points.status == "approved"].document_id.value_counts()
     documents.loc[point_counts.index, "num_approved"] = point_counts
 
-    deprecated_doc_ids = set(documents.loc[documents.is_deprecated].index)
-
     # Pre-compute sentence-splitting info (no need for docs without Points)
     # Maps doc id to list of char positions of sentence starts
-    sent_boundaries: dict[int, list[int]] = _get_sent_boundaries(documents[documents.index.isin(points.document_id)])
+    sent_boundaries: dict[int, list[int]] = get_sent_boundaries(documents[documents.index.isin(points.document_id)])
 
     # Points with some quote_start and quote_end will act as a starting place
     # We want to stretch the boundaries to start/end on sentences (because we will perform inference on sentence boundaries)
@@ -354,7 +420,6 @@ def make_sent_span_datasets(
             points,
             sent_boundaries,
             sample_window_size_fn,
-            deprecated_doc_ids,
             pending_not_found,
             comprehensive_threshold,
         )
@@ -369,7 +434,6 @@ def _build_sent_span_case_dataset(
     points,
     sent_boundaries,
     sample_window_size_fn,
-    deprecated_doc_ids,
     pending_not_found,
     comprehensive_threshold,
 ) -> pd.DataFrame:
@@ -386,12 +450,10 @@ def _build_sent_span_case_dataset(
     has_approved = declined.document_id.isin(set(approved.document_id))
     # Avoid points that were ever in a pending-not-found status, in case they are true negatives
     was_pending_not_found = declined.id.isin(pending_not_found[case_i])
-    # Avoid points from deprecated services or documents, because sometimes they were declined just for that
-    was_deprecated = declined.document_id.isin(deprecated_doc_ids)
-    declined = declined[~has_approved & ~was_pending_not_found & ~was_deprecated]
+    declined = declined[~has_approved & ~was_pending_not_found]
     logger.info(
         f"{len(declined)} declined points (excluded {has_approved.sum()} with approved doc,"
-        f" {was_pending_not_found.sum()} pending-not-found, {was_deprecated.sum()} deprecated)"
+        f" {was_pending_not_found.sum()} pending-not-found)"
     )
     declined = declined.assign(label="negative", source="declined", point_id=declined.id).drop("id", axis=1)
 
@@ -459,15 +521,19 @@ def make_doc_datasets(
             `label` is `positive` or `negative`
             `source` is one of ['approved', 'declined', 'random']
     """
+    cases = cases.copy()  # num_approved is attached below; don't mutate the caller's frame
     if en_only:
         documents = documents[documents.lang == "en"].copy()
         points = points[points.lang == "en"].copy()
 
-    # Attach num points
+    # Case selection uses the same quoted-approved count as the sent-span dataset and the threshold code, so all
+    # three cover the same set of cases (this doc dataset is an eval set for exactly the cases we train). The
+    # doc-level num_approved below counts all approved points — it gates the comprehensively-reviewed negative
+    # pool, which shouldn't require quotes — and stays self-contained (no dependency on make_sent_span_datasets).
+    case_counts = quoted_approved_case_counts(points)
+    cases.loc[case_counts.index, "num_approved"] = case_counts
     point_counts = points[points.status == "approved"].document_id.value_counts()
     documents.loc[point_counts.index, "num_approved"] = point_counts
-
-    deprecated_doc_ids = set(documents.loc[documents.is_deprecated].index)
 
     # Filter out docs without points
     documents = documents[documents.index.isin(points.document_id)]
@@ -487,7 +553,7 @@ def make_doc_datasets(
 
         # Docs with declined points, minus a few edge cases
         declined_points = case_points[case_points.status == "declined"]
-        declined_doc_ids = set(declined_points.document_id.unique()) - set(approved_docs.id_doc) - deprecated_doc_ids
+        declined_doc_ids = set(declined_points.document_id.unique()) - set(approved_docs.id_doc)
         # Also filter out any docs with points that were ever pending-not-found, just in case it's a true negative
         pending_not_found_docs = set()
         for point_id in pending_not_found[case_i]:
@@ -514,36 +580,48 @@ def make_doc_datasets(
 
 def assign_folds(sent_span_datasets, doc_datasets):
     """
-    Folds are split by document_id so a doc can't leak between the sent-span and doc datasets. Within
-    that constraint, docs are bucketed into those that contribute any positive instance vs. those that
-    don't, and each bucket is sliced across folds independently — this stratifies positives so each
-    fold gets a representative share (positives are rare for many cases, and uniform doc-ID shuffling
-    leaves cross-fold variance high).
+    Folds are split by service so near-duplicate documents from the same service (privacy policy vs ToS,
+    recrawls) can't leak between train and test — in either the sent-span or doc dataset, which share folds.
+    Within that constraint, services are bucketed into those contributing any positive instance vs. those
+    that don't, and each bucket is sliced across folds independently — this stratifies positives so each
+    fold gets a representative share (positives are rare for many cases, and uniform shuffling leaves
+    cross-fold variance high).
     """
 
     def _gen_fold_slice(n, fold_i):
         return slice(round(fold_i * (n / NUM_FOLDS)), round((fold_i + 1) * (n / NUM_FOLDS)))
 
+    # Both datasets share folds, so they must cover the same cases. quoted_approved_case_counts is the single
+    # case-selection definition used by both builders, so any mismatch here is a build bug — fail loudly.
+    if set(sent_span_datasets.keys()) != set(doc_datasets.keys()):
+        raise ValueError(
+            "Sent-span and doc datasets cover different cases: "
+            f"sent-only={sorted(set(sent_span_datasets) - set(doc_datasets))}, "
+            f"doc-only={sorted(set(doc_datasets) - set(sent_span_datasets))}"
+        )
+
     rng = random.Random(0)
-    for case_id in set(sent_span_datasets.keys()).union(set(doc_datasets.keys())):
+    for case_id in sorted(sent_span_datasets.keys()):
         sent_df = sent_span_datasets[case_id]
         doc_df = doc_datasets[case_id]
+
+        doc_service = dict(zip(sent_df.document_id, sent_df.service_id))
+        doc_service.update(zip(doc_df.id_doc, doc_df.id_service))
 
         positive_doc_ids = set(sent_df.loc[sent_df.label == "positive", "document_id"]).union(
             set(doc_df.loc[doc_df.label == "positive", "id_doc"])
         )
-        all_doc_ids = set(sent_df.document_id).union(set(doc_df.id_doc))
-        negative_only_doc_ids = all_doc_ids - positive_doc_ids
+        positive_services = sorted({doc_service[doc_id] for doc_id in positive_doc_ids})
+        negative_only_services = sorted(set(doc_service.values()) - set(positive_services))
 
-        positive_doc_ids = list(positive_doc_ids)
-        negative_only_doc_ids = list(negative_only_doc_ids)
-        rng.shuffle(positive_doc_ids)
-        rng.shuffle(negative_only_doc_ids)
+        rng.shuffle(positive_services)
+        rng.shuffle(negative_only_services)
 
         for fold_i in range(NUM_FOLDS):
-            fold_doc_ids = set(positive_doc_ids[_gen_fold_slice(len(positive_doc_ids), fold_i)]) | set(
-                negative_only_doc_ids[_gen_fold_slice(len(negative_only_doc_ids), fold_i)]
+            fold_services = set(positive_services[_gen_fold_slice(len(positive_services), fold_i)]) | set(
+                negative_only_services[_gen_fold_slice(len(negative_only_services), fold_i)]
             )
+            fold_doc_ids = {doc_id for doc_id, service in doc_service.items() if service in fold_services}
             sent_df.loc[sent_df.document_id.isin(fold_doc_ids), "fold"] = fold_i
             doc_df.loc[doc_df.id_doc.isin(fold_doc_ids), "fold"] = fold_i
         sent_df.fold = sent_df.fold.astype(int)
@@ -565,40 +643,19 @@ def assign_folds(sent_span_datasets, doc_datasets):
 def run():
     np.random.seed(0)
 
-    cases = pd.read_pickle(here / f"../data/db_dumps/{DB_DUMP_VERSION}/cases_clean.pkl")
-    documents = pd.read_pickle(here / f"../data/db_dumps/{DB_DUMP_VERSION}/documents_clean.pkl")
-    points = pd.read_pickle(here / f"../data/db_dumps/{DB_DUMP_VERSION}/points_clean.pkl")
-    services = pd.read_pickle(here / f"../data/db_dumps/{DB_DUMP_VERSION}/services_clean.pkl")
-    versions = pd.read_pickle(here / f"../data/db_dumps/{DB_DUMP_VERSIONS_VERSION}/versions.pkl")
+    cases, documents, points = load_clean_dumps()
 
-    # Drop points not associated with a doc
-    points = points[points.document_id.notna()]
+    versions = pd.read_pickle(here / f"../data/db_dumps/{DB_DUMP_VERSION}/versions.pkl")
 
-    # Join service info onto documents, avoiding duplicate columns
-    documents = pd.merge(
-        documents.drop(["id_service", "name_service"], axis=1),
-        services,
-        left_on="service_id",
-        right_index=True,
-        suffixes=["_doc", "_service"],
-    )
-    # Docs and services with a `deleted` status were dropped in explore.ipynb, but as of 5/26 we don't always use it,
-    # instead adding 'deprecated' to the name somewhere
-    documents["is_deprecated"] = documents.name_doc.str.lower().str.contains(
-        "deprecated", na=False
-    ) | documents.name_service.str.lower().str.contains("deprecated", na=False)
     # Clean up html, which is necessary for good sentence splitting. This should be done for inference as well.
     documents["text"] = documents.text.apply(utils.preprocess_doc_text)
     points["text"] = points.quote_text.apply(lambda text: None if pd.isna(text) else utils.preprocess_doc_text(text))
-    # type coercion
-    points["document_id"] = points.document_id.astype(np.int64)
 
     # Load points that have ever been in a pending-not-found state
     pending_not_found: dict[int, set[int]] = _load_pending_not_found(versions, points)
 
-    comprehensive_threshold = 12
-    sent_span_datasets = make_sent_span_datasets(cases, documents, points, pending_not_found, comprehensive_threshold)
-    doc_datasets = make_doc_datasets(cases, documents, points, pending_not_found, comprehensive_threshold)
+    sent_span_datasets = make_sent_span_datasets(cases, documents, points, pending_not_found, COMPREHENSIVE_THRESHOLD)
+    doc_datasets = make_doc_datasets(cases, documents, points, pending_not_found, COMPREHENSIVE_THRESHOLD)
     sent_span_datasets, doc_datasets = assign_folds(sent_span_datasets, doc_datasets)
 
     logger.info(f"Saving sentence span classification datasets to {SENT_SPAN_LOC}")
@@ -627,4 +684,5 @@ def run():
 
 
 if __name__ == "__main__":
+    ArgumentParser(description="Build per-case sentence span and document classification datasets").parse_args()
     run()

@@ -21,7 +21,7 @@ import torch
 from tqdm import tqdm
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-from src import inference, phoenix, utils, apply_local, make_classification_datasets
+from src import aws_auth, inference, phoenix, utils, apply_local, make_classification_datasets
 from src.inference import MODEL_VERSION
 
 """
@@ -63,8 +63,9 @@ class DocStore:
 
         self.local_data = local_data
         self.phoenix_client = phoenix_client
-        # Non-clean version to match the DB
-        self.local_docs = pd.read_pickle(here / f"../data/db_dumps/{apply_local.LOCAL_DUMP_VERSION}/documents.pkl")
+        if self.local_data:
+            # Non-clean version to match the DB. Only loaded in local mode -- the pkl isn't baked into Docker images.
+            self.local_docs = pd.read_pickle(here / f"../data/db_dumps/{apply_local.LOCAL_DUMP_VERSION}/documents.pkl")
 
         # Since we plan to use one machine we can just keep docs in memory here. If we scale up to a big cluster we can
         # have them share a cache.
@@ -132,34 +133,14 @@ def s3_fileobj(bucket, key, s3_client):
     yield BytesIO(obj["Body"].read())
 
 
-def get_aws_creds() -> dict[str, str]:
-    client = boto3.client("sts")
-    response = client.assume_role(
-        RoleArn=os.environ["AWS_ROLE"],
-        RoleSessionName=f"docbot-infer-{int(time.time())}",
-        DurationSeconds=43200,  # 12 hour max
-    )
-    return {
-        "aws_access_key_id": response["Credentials"]["AccessKeyId"],
-        "aws_secret_access_key": response["Credentials"]["SecretAccessKey"],
-        "aws_session_token": response["Credentials"]["SessionToken"],
-    }
-
-
 def load_peft_model(case_id, base_model, local_models):
     if local_models:
         peft_model_loc = apply_local.peft_path(case_id)
         logger.info(f"Initializing PEFT adapter from {peft_model_loc}")
     else:
-        # Each case could take a long time, so get new IAM Role credentials to be safe (12 hour limit)
-        creds = get_aws_creds()
-        s3_client = boto3.client(
-            "s3",
-            aws_access_key_id=creds["aws_access_key_id"],
-            aws_secret_access_key=creds["aws_secret_access_key"],
-            aws_session_token=creds["aws_session_token"],
-            config=BOTO_CONFIG,
-        )
+        # Credentials come from the process-wide assumed-role session (auto-refreshing), so a fresh client here
+        # is always valid no matter how long earlier cases took
+        s3_client = boto3.client("s3", config=BOTO_CONFIG)
 
         tmpdir = tempfile.TemporaryDirectory()
         logger.info(f"Pulling PEFT adapter from: s3://{MODEL_S3_BUCKET}/{MODEL_VERSION}/{case_id}/adapter_model.bin")
@@ -168,6 +149,17 @@ def load_peft_model(case_id, base_model, local_models):
                 with open(f"{tmpdir.name}/{filename}", "wb") as to_file:
                     to_file.write(f.read())
         peft_model_loc = tmpdir.name
+
+        # The thresholds menu ships alongside the adapters; cache it where inference.get_threshold() looks.
+        # Model versions predating thresholds.json (v3) fall back to the legacy inference.THRESHOLDS dict.
+        try:
+            with s3_fileobj(MODEL_S3_BUCKET, f"{MODEL_VERSION}/{case_id}/thresholds.json", s3_client) as f:
+                local_dir = inference.model_dir(case_id)
+                local_dir.mkdir(parents=True, exist_ok=True)
+                with open(local_dir / "thresholds.json", "wb") as to_file:
+                    to_file.write(f.read())
+        except s3_client.exceptions.NoSuchKey:
+            logger.info(f"No thresholds.json in S3 for case {case_id}, will use the legacy threshold")
 
     model = PeftModel.from_pretrained(base_model, peft_model_loc)
     # https://github.com/huggingface/peft/issues/217#issuecomment-1506224612
@@ -183,7 +175,6 @@ def run_case(
     doc_list: list[tuple[int, str]],
     doc_store,
     phoenix_client,
-    threshold: float,
     batch_size: int,
     device: str,
     skip_point_check: bool = False,
@@ -194,9 +185,11 @@ def run_case(
     :param local_data: If True gets docs and points via local DB dumps, otherwise hits the phoenix API
     :param dont_post: Don't POST results (new points and docbot records) to phoenix, just run locally
     :param doc_list: (Doc ID, text version) tuples
-    :param threshold: Score threshold used to decide wheather a new pending point should be created
     :param skip_point_check: Don't skip a case/doc pair if there is an existing point (used for local inference)
     :return:
+
+    The score threshold deciding whether a new pending point is created comes from inference.get_threshold(),
+    resolved after model artifacts are pulled (thresholds.json is fetched alongside the adapters).
     """
     points = pd.DataFrame()
     if not skip_point_check:
@@ -219,6 +212,8 @@ def run_case(
     base_model = AutoModelForSequenceClassification.from_pretrained(inference.BASE_MODEL_NAME)
     model = load_peft_model(case_id, base_model, local_models)
     model = model.to(device)
+    threshold = inference.get_threshold(case_id)
+    logger.info(f"Using threshold {threshold:.4f} (operating point {inference.DEFAULT_OPERATING_POINT})")
     # Tokenizer can be reused across cases (passed from run_all_cases)
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained(inference.BASE_MODEL_NAME)
@@ -476,8 +471,7 @@ def run_all_cases(
 
     s3_client = None
     if not dont_post or not local_models:
-        # pyrefly: ignore[no-matching-overload]  # boto3 client overloads don't accept **dict unpacking
-        s3_client = boto3.client("s3", **get_aws_creds(), config=BOTO_CONFIG)
+        s3_client = boto3.client("s3", config=BOTO_CONFIG)
 
     # Load a list of case IDs
     if local_models:
@@ -523,7 +517,6 @@ def run_all_cases(
             doc_list,
             doc_store,
             phoenix_client,
-            inference.THRESHOLDS[case_id],
             batch_size,
             device,
             tokenizer=tokenizer,
@@ -541,12 +534,11 @@ def run_all_cases(
             pred_scores = [d["score"] for d in result_scores.values()]
             logger.info(f"Prediction scores:\n{pd.Series(pred_scores).describe()}")
 
-        # Serialize latest results in case of crash
-        # Get new S3 credentials in case the 12 hour limit ran out
-        if not dont_post or not local_models:
-            # pyrefly: ignore[no-matching-overload]  # boto3 client overloads don't accept **dict unpacking
-            s3_client = boto3.client("s3", **get_aws_creds(), config=BOTO_CONFIG)
-    save_results(case_result_scores, case_result_counts, results_dir, None if dont_post else s3_client, timestamp_key)
+        # Serialize latest results in case of crash. The assumed-role session auto-refreshes, so the s3_client
+        # created at startup stays valid past the old 12-hour credential limit.
+        save_results(
+            case_result_scores, case_result_counts, results_dir, None if dont_post else s3_client, timestamp_key
+        )
 
     end_s = time.time()
     logger.info(f"Ending at {int(end_s)} for a duration of {end_s - start_s:.3f} seconds")
@@ -594,6 +586,15 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=16)
     parser.set_defaults(local_models=False, local_data=False, dont_post=False, cuda_only=False, skip_point_check=False)
     args = parser.parse_args()
+
+    # Inference hosts authenticate as the bootstrap IAM user (env-var keys) and assume tosdr-infer for the S3 work.
+    # Only needed when models come from S3. Set AWS_SKIP_ASSUME_ROLE=1 to use ambient creds instead (e.g. running
+    # locally from a root profile that already has access).
+    if not args.local_models and not os.environ.get("AWS_SKIP_ASSUME_ROLE"):
+        # Role ARN comes from AWS_ACCOUNT (or a full AWS_INFER_ROLE_ARN override); the host itself only needs the
+        # tosdr-infer-bootstrap user's keys in the environment.
+        infer_role_arn = aws_auth.role_arn("tosdr-infer", "AWS_INFER_ROLE_ARN")
+        aws_auth.install_assumed_role_session(infer_role_arn, AWS_REGION, session_prefix="docbot-infer")
 
     device = resolve_device(args)
     run_all_cases(

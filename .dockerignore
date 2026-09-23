@@ -1,5 +1,8 @@
+.venv
+.git
 data
-!data/db_dumps/2026-01-28/*.pkl
+!data/db_dumps/2026-07-09/sent_span_classification_v*.pkl
+!data/db_dumps/2026-07-09/doc_classification_v*.pkl
 !data/models/tfidf_v2
 logs
 wandb
@@ -11,4 +14,11 @@ tst
 .DS_Store
 .idea/
 .vs/
-.claude
+.claude.env
+.env.*
+*.pem
+*.key
+credentials
+credentials.*
+bootstrap-assume.json
+trust-with-expiry.json
