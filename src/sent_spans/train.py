@@ -20,7 +20,14 @@ import pandas as pd
 from datasets import Dataset
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from scipy.special import softmax
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
@@ -42,6 +49,8 @@ here = Path(__file__).parent
 CLASSIFICATION_VERSION = make_classification_datasets.LATEST_VERSION
 # Fraction of docs held out of each training pool purely for early stopping / model selection
 STOPPING_FRACTION = 0.1
+# Extra seeds tried when an attempt's model collapses to predicting no positives (see _is_collapsed)
+MAX_COLLAPSE_RETRIES = 2
 
 # Predictions attached to the doc dataset and persisted in results. pred_label is deliberately excluded: it comes
 # from an oracle threshold fit on the eval set itself (inference.attach_predictions), fine for relative model
@@ -75,7 +84,7 @@ def case_models_dir(case_id) -> Path:
 
 
 def tmp_attempt_best_loc(case_id) -> Path:
-    # Best checkpoint within the current attempt, according to doc F1 on the stopping slice (DocEvalCallback)
+    # Best checkpoint within the current attempt, according to doc AP on the stopping slice (DocEvalCallback)
     dir_path = case_models_dir(case_id) / "tmp_attempt_best"
     dir_path.mkdir(parents=True, exist_ok=True)
     return dir_path
@@ -199,20 +208,25 @@ def _test_fold_metrics(doc_pred: pd.DataFrame, sent_scores, sent_labels, sent_so
 
     doc f1/prec/rec/accuracy inherit inference.attach_predictions' threshold, which is fit on the set being scored
     — fine for comparing folds and attempts, which is what these are for, but optimistic as absolute numbers. The
-    stop/doc_* equivalents share that caveat. test/doc_roc_auc is threshold-free.
+    stop/doc_* equivalents share that caveat. The roc_auc and ap metrics are threshold-free; ap is the headline
+    metric since positives are rare and it tracks the precision/recall tradeoff the thresholds menu ships.
     """
     doc_labels = doc_pred.int_labels
     sent_preds = (sent_scores >= 0.5).astype(int)
+    doc_both_classes = doc_labels.nunique() > 1
+    sent_both_classes = len(np.unique(sent_labels)) > 1
     metrics = {
         "test/doc_f1": f1_score(doc_labels, doc_pred.pred_label, zero_division=0),
         "test/doc_prec": precision_score(doc_labels, doc_pred.pred_label, zero_division=0),
         "test/doc_rec": recall_score(doc_labels, doc_pred.pred_label, zero_division=0),
         "test/doc_accuracy": accuracy_score(doc_labels, doc_pred.pred_label),
-        "test/doc_roc_auc": roc_auc_score(doc_labels, doc_pred.pred_score) if doc_labels.nunique() > 1 else np.nan,
+        "test/doc_roc_auc": roc_auc_score(doc_labels, doc_pred.pred_score) if doc_both_classes else np.nan,
+        "test/doc_ap": average_precision_score(doc_labels, doc_pred.pred_score) if doc_both_classes else np.nan,
         "test/sent_f1_pos": f1_score(sent_labels, sent_preds, zero_division=0),
         "test/sent_prec_pos": precision_score(sent_labels, sent_preds, zero_division=0),
         "test/sent_rec_pos": recall_score(sent_labels, sent_preds, zero_division=0),
-        "test/sent_roc_auc": roc_auc_score(sent_labels, sent_scores) if len(np.unique(sent_labels)) > 1 else np.nan,
+        "test/sent_roc_auc": roc_auc_score(sent_labels, sent_scores) if sent_both_classes else np.nan,
+        "test/sent_ap": average_precision_score(sent_labels, sent_scores) if sent_both_classes else np.nan,
     }
     # Positive rate per source, as in DocEvalCallback, but over the whole fold instead of the ~10% stopping slice.
     # Rare sources (`declined` is single digits per fold) are reliably present here and frequently absent from the
@@ -381,14 +395,15 @@ def _run_attempts(
 ) -> tuple[float, pd.DataFrame, TestFoldPreds | None]:
     """
     Trains cfg.attempts_per_fold models on `train_idxs`, using the stopping slice (`stop_idxs` sent spans,
-    `stop_doc_df` docs) for early stopping and model selection. The best model across attempts, by doc F1 on the
-    stopping slice, ends up in tmp_best_loc(case_id).
+    `stop_doc_df` docs) for early stopping and model selection. The best model across attempts, by doc AP on the
+    stopping slice, ends up in tmp_best_loc(case_id). An attempt whose model collapses (_is_collapsed) is retrained
+    with a fresh seed, up to MAX_COLLAPSE_RETRIES times, and only the retry takes part in selection.
 
     In CV mode the caller also passes the fold's held-out test data (`test_idxs`, `test_doc_df`). Each attempt
     predicts it after training, purely so per-fold and per-attempt variance is visible in wandb under test/ —
     selection still runs off the stopping slice alone, which is what keeps those predictions honestly out-of-fold
     for thresholds.py.
-    :return: the best stopping-slice doc F1, the corresponding stopping-slice doc predictions, and the winning
+    :return: the best stopping-slice doc AP, the corresponding stopping-slice doc predictions, and the winning
         attempt's test-fold predictions (None with --train_final, which has no test fold)
     """
     title = sent_spans_df.iloc[0].title
@@ -396,62 +411,83 @@ def _run_attempts(
     best_stop_doc_preds = None
     best_test_preds = None
     for attempt in range(cfg.attempts_per_fold):
-        logger.info(f"Case id {case_id}: {title}")
-        logger.info(f"{fold_label}, attempt {attempt + 1} / {cfg.attempts_per_fold}")
-        logger.info(f"{len(train_idxs)} train instances, {len(stop_idxs)} stopping-slice instances")
-        logger.info(f"{len(stop_doc_df)} stopping-slice doc instances")
-        run = None
-        if cfg.log_wandb:
-            run = wandb.init(
-                project="tosdr_cases",
-                group=str(case_id),
-                name=f"{case_id}-{fold_label}-a{attempt}",
-                job_type="final" if fold_label == "final" else "cv",
-                config=dict(
-                    case_id=case_id,
-                    case_title=title,
-                    fold=fold_label,
-                    attempt=attempt,
-                    model_base=cfg.model_base,
-                    dataset_version=CLASSIFICATION_VERSION,
-                ),
-            )
-            wandb.define_metric("stop/doc_f1", summary="max")
-            wandb.define_metric("eval/f1_pos", summary="max")
-        with run if run is not None else contextlib.nullcontext():
-            pos_f1, stop_doc_preds = _train_one_attempt(
-                tokenized.select(train_idxs),
-                tokenized.select(stop_idxs),
-                stop_doc_df,
-                case_id,
-                cfg,
-                tokenizer,
-                doc_eval_kwargs,
-                stop_sources=sent_spans_df.source.to_numpy()[stop_idxs],
-                seed=42 + attempt,
-            )
-            attempt_test_preds = None
-            if test_idxs is not None:
-                attempt_test_preds = _predict_test_fold(
-                    sent_spans_df,
-                    tokenized,
-                    tokenizer,
+        attempt_test_preds = None
+        for retry in range(MAX_COLLAPSE_RETRIES + 1):
+            # Retries step by 1000 so they can't reuse another attempt's seed
+            seed = 42 + attempt + 1000 * retry
+            logger.info(f"Case id {case_id}: {title}")
+            retry_label = f", collapse retry {retry} / {MAX_COLLAPSE_RETRIES}" if retry else ""
+            logger.info(f"{fold_label}, attempt {attempt + 1} / {cfg.attempts_per_fold}{retry_label}")
+            logger.info(f"{len(train_idxs)} train instances, {len(stop_idxs)} stopping-slice instances")
+            logger.info(f"{len(stop_doc_df)} stopping-slice doc instances")
+            run = None
+            if cfg.log_wandb:
+                run = wandb.init(
+                    project="tosdr_cases",
+                    group=str(case_id),
+                    name=f"{case_id}-{fold_label}-a{attempt}" + (f"-r{retry}" if retry else ""),
+                    job_type="final" if fold_label == "final" else "cv",
+                    config=dict(
+                        case_id=case_id,
+                        case_title=title,
+                        fold=fold_label,
+                        attempt=attempt,
+                        retry=retry,
+                        seed=seed,
+                        model_base=cfg.model_base,
+                        dataset_version=CLASSIFICATION_VERSION,
+                    ),
+                )
+                wandb.define_metric("stop/doc_f1", summary="max")
+                wandb.define_metric("stop/doc_ap", summary="max")
+                wandb.define_metric("eval/f1_pos", summary="max")
+                wandb.define_metric("eval/ap", summary="max")
+            with run if run is not None else contextlib.nullcontext():
+                stop_doc_ap, stop_doc_preds, collapsed = _train_one_attempt(
+                    tokenized.select(train_idxs),
+                    tokenized.select(stop_idxs),
+                    stop_doc_df,
                     case_id,
                     cfg,
+                    tokenizer,
                     doc_eval_kwargs,
-                    test_idxs,
-                    test_doc_df,
-                    tmp_attempt_best_loc(case_id),
+                    stop_sources=sent_spans_df.source.to_numpy()[stop_idxs],
+                    seed=seed,
                 )
-            if run is not None:
-                # The metric attempt selection actually uses (doc F1 of the attempt's best checkpoint)
-                run.summary["attempt_stop_doc_f1"] = pos_f1
-                if attempt_test_preds is not None:
-                    # Summary rather than log: one value per run, so wandb can table/scatter them across the
-                    # fold and attempt config fields to show variance
-                    run.summary.update(attempt_test_preds.metrics)
-        if pos_f1 > best_metric:
-            best_metric = pos_f1
+                if run is not None:
+                    run.summary["collapsed"] = collapsed
+                if collapsed and retry < MAX_COLLAPSE_RETRIES:
+                    # Skip test-fold prediction and attempt selection for this run; the retry replaces it
+                    logger.warning(f"{fold_label} attempt {attempt + 1} collapsed (seed {seed}); retrying")
+                    continue
+                if collapsed:
+                    logger.warning(
+                        f"{fold_label} attempt {attempt + 1} still collapsed after {MAX_COLLAPSE_RETRIES} retries; "
+                        "keeping it, so attempt selection decides"
+                    )
+                if test_idxs is not None:
+                    attempt_test_preds = _predict_test_fold(
+                        sent_spans_df,
+                        tokenized,
+                        tokenizer,
+                        case_id,
+                        cfg,
+                        doc_eval_kwargs,
+                        test_idxs,
+                        test_doc_df,
+                        tmp_attempt_best_loc(case_id),
+                    )
+                if run is not None:
+                    # The metric attempt selection actually uses (doc AP of the attempt's best checkpoint). Runs
+                    # before the switch to AP selection logged attempt_stop_doc_f1 instead
+                    run.summary["attempt_stop_doc_ap"] = stop_doc_ap
+                    if attempt_test_preds is not None:
+                        # Summary rather than log: one value per run, so wandb can table/scatter them across the
+                        # fold and attempt config fields to show variance
+                        run.summary.update(attempt_test_preds.metrics)
+            break
+        if stop_doc_ap > best_metric:
+            best_metric = stop_doc_ap
             best_stop_doc_preds = stop_doc_preds
             best_test_preds = attempt_test_preds
             # Promote this attempt's best checkpoint to the case-level best. Full replace, never a merge, so a
@@ -459,18 +495,19 @@ def _run_attempts(
             shutil.rmtree(tmp_best_loc(case_id), ignore_errors=True)
             shutil.copytree(tmp_attempt_best_loc(case_id), tmp_best_loc(case_id))
 
-    # Always set on the first attempt since pos_f1 >= 0 > best_metric's initial -1.0
+    # Always set on the first attempt since stop_doc_ap >= 0 > best_metric's initial -1.0
     assert best_stop_doc_preds is not None
     return best_metric, best_stop_doc_preds, best_test_preds
 
 
 def _train_one_attempt(
     train_dataset, stop_dataset, stop_doc_df, case_id, cfg: TrainConfig, tokenizer, doc_eval_kwargs, stop_sources, seed
-) -> tuple[float, pd.DataFrame]:
+) -> tuple[float, pd.DataFrame, bool]:
     """
-    A single training run. Early stopping uses sent-span F1 on the stopping slice; the best checkpoint by doc F1
+    A single training run. Early stopping uses sent-span AP on the stopping slice; the best checkpoint by doc AP
     on the stopping slice (tracked by DocEvalCallback) is saved to tmp_attempt_best_loc(case_id).
-    :return: that checkpoint's stopping-slice doc F1 and doc predictions
+    :return: that checkpoint's stopping-slice doc AP and doc predictions, and whether it collapsed (see
+        _is_collapsed)
     """
     # Seed everything (including the head/LoRA init below) per attempt, so attempts are controlled random
     # restarts rather than depending on incidental global RNG state
@@ -494,7 +531,8 @@ def _train_one_attempt(
         save_total_limit=1,
         learning_rate=cfg.learning_rate,
         load_best_model_at_end=True,
-        metric_for_best_model="f1_pos",
+        # Threshold-free, so patience isn't reset or exhausted by argmax-threshold jitter the way f1_pos is
+        metric_for_best_model="ap",
         seed=seed,
         bf16=cfg.device == "cuda",  # bert-base trains fine in bf16, roughly doubling throughput on modern GPUs
     )
@@ -510,13 +548,17 @@ def _train_one_attempt(
     def compute_metrics(eval_pred):
         logits, labels = eval_pred
         predictions = np.argmax(logits, axis=-1)
+        # The logit difference is monotone in the softmax positive probability; logits[:, 1] alone is not
+        scores = logits[:, 1] - logits[:, 0]
+        both_classes = len(np.unique(labels)) > 1
         metrics = {
             "f1_pos": f1_score(labels, predictions, zero_division=0),
             "prec_pos": precision_score(labels, predictions, zero_division=0),
             "rec_pos": recall_score(labels, predictions, zero_division=0),
             "accuracy": accuracy_score(labels, predictions),
-            # The logit difference is monotone in the softmax positive probability; logits[:, 1] alone is not
-            "roc_auc": roc_auc_score(labels, logits[:, 1] - logits[:, 0]) if len(np.unique(labels)) > 1 else np.nan,
+            "roc_auc": roc_auc_score(labels, scores) if both_classes else np.nan,
+            # 0 rather than NaN when undefined, since this drives early stopping and NaN never compares as better
+            "ap": average_precision_score(labels, scores) if both_classes else 0.0,
         }
         # Positive prediction rate per instance source (approved/declined/surrounding/topical/...), to audit
         # negative sources for mislabeled true negatives. This closure is also invoked on the training subset by
@@ -556,7 +598,21 @@ def _train_one_attempt(
     assert doc_eval_callback.best_doc_preds is not None, (
         "DocEvalCallback never evaluated; training may be too short for the configured eval_steps"
     )
-    return doc_eval_callback.best_f1, doc_eval_callback.best_doc_preds
+    collapsed = _is_collapsed(doc_eval_callback.best_sent_metrics, stop_labels)
+    return doc_eval_callback.best_score, doc_eval_callback.best_doc_preds, collapsed
+
+
+def _is_collapsed(stop_sent_metrics: dict, stop_labels: np.ndarray) -> bool:
+    """
+    A collapsed run's saved checkpoint predicts no positive sentences on the stopping slice despite it containing
+    positives (sent F1 of 0 at the argmax threshold). The same failure shows up downstream as test/sent_f1_pos == 0.
+    This is checked on the stopping slice rather than the test fold so that the test fold still plays no part in any
+    selection decision, retries included.
+    """
+    if not stop_labels.any():
+        # f1_pos is 0 by definition without positives, so a retry could never get out of it
+        return False
+    return stop_sent_metrics.get("eval_f1_pos", 0.0) == 0.0
 
 
 def results_dir(results_key, final=False) -> Path:
@@ -714,7 +770,7 @@ def train_serial(args, cfg: TrainConfig, dataset_dict, doc_dataset_dict, doc_sen
     """
     Method 1 of running: single process
     Looping through all cases. May take days to train. Results are saved locally as pickled dictionaries from
-    case_id to dataframes that include predictions using the best model (as measured by F1 on the doc dataset).
+    case_id to dataframes that include predictions using the best model (as measured by AP on the doc dataset).
     Results are written/cached after each case model, so if this crashes you can restart with the same
     --model_version and already-trained cases will be skipped. Rerunning a version after a code or dataset change
     hits the same cache — delete data/training/{model_version}/ first to retrain from scratch.

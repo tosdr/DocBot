@@ -4,6 +4,7 @@ wandb
 notebooks/.ipynb_checkpoints
 notebooks/blog.ipynb
 **/__pycache__/
+**/__marimo__/
 .DS_Store
 .idea/
 .vs/

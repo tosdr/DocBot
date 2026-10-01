@@ -1,9 +1,17 @@
 import logging
 from typing import Callable
 
+import numpy as np
 import pandas as pd
 from datasets import Dataset
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 from transformers import TrainerCallback
 
 import wandb
@@ -46,10 +54,15 @@ class DocEvalCallback(TrainerCallback):
         self.save_to_dir = save_to_dir
         self.log_wandb = log_wandb
         self.device = device
-        self.best_f1 = -1.0
-        # Predictions from the best checkpoint so far; train.py uses (best_f1, best_doc_preds) to pick the
+        # Best stop/doc_ap so far. AP rather than F1 because F1 here comes from an oracle threshold fit on the
+        # (small) slice itself, so it moves in large jumps between evals and checkpoint selection chases noise
+        self.best_score = -1.0
+        # Predictions from the best checkpoint so far; train.py uses (best_score, best_doc_preds) to pick the
         # best attempt without re-running doc inference
         self.best_doc_preds: pd.DataFrame | None = None
+        # The Trainer's sent-span metrics on the stopping slice (eval_f1_pos, eval_ap, ...) at that same
+        # checkpoint, so train.py can check the saved model for collapse without another inference pass
+        self.best_sent_metrics: dict = dict()
 
     def on_evaluate(self, args, state, control, **kwargs):
         model = kwargs["model"]
@@ -81,6 +94,7 @@ class DocEvalCallback(TrainerCallback):
             "stop/doc_rec": recall_score(labels, doc_df.pred_label, zero_division=0),
             "stop/doc_accuracy": accuracy_score(labels, doc_df.pred_label),
             "stop/doc_roc_auc": roc_auc_score(labels, doc_df.pred_score) if labels.nunique() > 1 else float("nan"),
+            "stop/doc_ap": average_precision_score(labels, doc_df.pred_score) if labels.nunique() > 1 else float("nan"),
         }
         # Positive prediction rate per instance source (approved/declined/reviewed), to audit negative
         # sources for mislabeled true negatives. Sources absent from this slice simply don't appear; the
@@ -94,12 +108,14 @@ class DocEvalCallback(TrainerCallback):
 
         # Normally the Trainer class keeps track of the best model using its standard evaluation loop on the test
         # set. In our case we want to use the doc dataset to select the best model, so we'll keep track here.
-        f1 = float(metrics["stop/doc_f1"])
-        if f1 > self.best_f1:
-            self.best_f1 = f1
+        # AP is undefined without both classes in the slice; count that as 0 so the first eval still saves a model
+        score = float(np.nan_to_num(metrics["stop/doc_ap"], nan=0.0))
+        if score > self.best_score:
+            self.best_score = score
             self.best_doc_preds = doc_df
+            self.best_sent_metrics = dict(kwargs.get("metrics") or {})
             save_dir = self.save_to_dir(self.case_id)
-            logger.info(f"****** Found a new top f1 score of {f1:.4f}, saving model to {save_dir}")
+            logger.info(f"****** Found a new top doc AP of {score:.4f}, saving model to {save_dir}")
             model.save_pretrained(save_dir)
             # Should probably save trainer state here too
 
