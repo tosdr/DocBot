@@ -52,6 +52,19 @@ STOPPING_FRACTION = 0.1
 # Extra seeds tried when an attempt's model collapses to predicting no positives (see _is_collapsed)
 MAX_COLLAPSE_RETRIES = 2
 
+# Supported --model_base values, mapped to LoraConfig overrides where PEFT's defaults don't fit. PEFT targets
+# query/value for bert, roberta and deberta-v2, and trains the `classifier` head fully (modules_to_save)
+MODEL_BASES = {
+    "bert-base-uncased": {},
+    "nlpaueb/legal-bert-base-uncased": {},
+    "roberta-base": {},
+    "mukund/privbert": {},  # RoBERTa further pretrained on ~1M privacy policies (PrivaSeer)
+    # The checkpoint has no pooler weights, so it's randomly initialized and must be trained, not left frozen
+    "microsoft/deberta-v3-base": dict(modules_to_save=["classifier", "pooler"]),
+    # No PEFT default for ModernBERT. Wqkv is the fused attention projection, the analog of BERT's query/value
+    "answerdotai/ModernBERT-base": dict(target_modules=["Wqkv"]),
+}
+
 # Predictions attached to the doc dataset and persisted in results. pred_label is deliberately excluded: it comes
 # from an oracle threshold fit on the eval set itself (inference.attach_predictions), fine for relative model
 # selection during training but misleading as a stored prediction.
@@ -513,7 +526,7 @@ def _train_one_attempt(
     # restarts rather than depending on incidental global RNG state
     set_seed(seed)
     model = AutoModelForSequenceClassification.from_pretrained(cfg.model_base, num_labels=2)
-    lora_args = dict(r=16, lora_alpha=16, lora_dropout=0.1, bias="all")
+    lora_args = dict(r=16, lora_alpha=16, lora_dropout=0.1, bias="all", **MODEL_BASES[cfg.model_base])
     logger.info(f"Training Lora with args {lora_args}")
     # pyrefly: ignore[bad-argument-type]  # bias literal is widened to str through **lora_args unpacking
     peft_config = LoraConfig(task_type=TaskType.SEQ_CLS, inference_mode=False, **lora_args)
@@ -534,7 +547,8 @@ def _train_one_attempt(
         # Threshold-free, so patience isn't reset or exhausted by argmax-threshold jitter the way f1_pos is
         metric_for_best_model="ap",
         seed=seed,
-        bf16=cfg.device == "cuda",  # bert-base trains fine in bf16, roughly doubling throughput on modern GPUs
+        bf16=cfg.device == "cuda",  # bert-base trains fine in bf16, roughly doubling throughput on modern GPUs.
+        # DeBERTa-v3 has known fp16 overflow issues; bf16's wider range usually avoids them, but watch for collapse
     )
     # Explicit "none" matters: TrainingArguments' default report_to is all installed integrations, which would
     # attach WandbCallback (and call wandb.init) even when log_wandb is off
@@ -945,12 +959,7 @@ if __name__ == "__main__":
         help="Upload results to S3 under the model version: CV runs put LORA models and test-fold predictions in "
         "{model_version}/cv/, --train_final puts production artifacts in {model_version}/. Requires --model_version",
     )
-    parser.add_argument(
-        "--model_base",
-        type=str,
-        choices=["bert-base-uncased", "roberta-base", "nlpaueb/legal-bert-base-uncased"],
-        default="bert-base-uncased",
-    )
+    parser.add_argument("--model_base", type=str, choices=list(MODEL_BASES), default="bert-base-uncased")
     parser.add_argument(
         "--train_final",
         action="store_true",
@@ -968,7 +977,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--batch_size", type=int, default=32, help="Default is ideal for 24gb GPU memory")
     parser.add_argument("--learning_rate", type=float, default=5e-04)
-    parser.add_argument("--attempts_per_fold", type=int, default=3)
+    parser.add_argument("--attempts_per_fold", type=int, default=1)
     parser.add_argument(
         "--cv_folds",
         type=int,
@@ -979,6 +988,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval_steps", type=int, default=8)
     parser.add_argument("--num_train_epochs", type=int, default=50)
     parser.add_argument("--early_stopping_patience", type=int, default=28)
+    parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging (always off with --debug)")
     parser.set_defaults(debug=False, all=False, eval_training=False)
     args = parser.parse_args()
 
@@ -1021,7 +1031,7 @@ if __name__ == "__main__":
     np.random.seed(0)
     trainer_callbacks.logger = logger
 
-    log_wandb = True
+    log_wandb = not args.no_wandb
     device = "cuda"
     if args.debug:
         log_wandb = False

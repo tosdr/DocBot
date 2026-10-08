@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.23.13"
+__generated_with = "0.25.0"
 app = marimo.App(width="medium")
 
 
@@ -74,7 +74,14 @@ def _(Path):
     # Categorical slots 1-3 of the reference palette, paired with distinct markers so attempts aren't color-only
     ATTEMPT_STYLE = {0: ("#2a78d6", "o"), 1: ("#eb6834", "s"), 2: ("#1baf7a", "^")}
     CASE_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]
-    return ATTEMPT_STYLE, CASE_COLORS, CASE_FOLD, HISTORY_CACHE_DIR, METRICS, WANDB_PROJECT
+    return (
+        ATTEMPT_STYLE,
+        CASE_COLORS,
+        CASE_FOLD,
+        HISTORY_CACHE_DIR,
+        METRICS,
+        WANDB_PROJECT,
+    )
 
 
 @app.cell
@@ -118,9 +125,13 @@ def _(mo):
     mo.md(r"""
     ## The runs
 
-    The analyses use the **baseline** run set: the first CV run on the four test cases (`bert-base-uncased`, 3
-    attempts per fold, attempts selected on `stop/doc_f1`). Edit the filter below to point them at later runs;
-    e.g. rerunning Q2 on AP-selected runs will show whether switching the selection metric helped.
+    There are two run sets, both on the four test cases with identical folds and stopping slices:
+
+    - **baseline** (`cv_runs`, September 2026): `bert-base-uncased` at LR 5e-4, 3 attempts per fold, attempts selected
+      on `stop/doc_f1`. These runs predate AP logging. Q1–Q4 use them, since they need several seeds per case-fold.
+    - **sweep** (`sweep_runs`, October 2026): 7 configurations at 1 attempt per fold, checkpoints and attempts selected
+      on `stop/doc_ap`. `bert-base-uncased` at LR 2e-4, 5e-4 and 1e-3, plus `nlpaueb/legal-bert-base-uncased`,
+      `roberta-base`, `mukund/privbert` and `microsoft/deberta-v3-base` at 5e-4. Q5 and Q6 use them.
     """)
     return
 
@@ -145,6 +156,26 @@ def _(CASE_FOLD, all_runs, np):
         columns=lambda f: f"fold {f} attempts"
     ).reset_index()
     return cv_runs, n_attempts
+
+
+@app.cell
+def _(CASE_FOLD, all_runs, pd):
+    BASELINE_CONFIG = "bert-base-uncased @ 5e-4"
+    sweep_runs = all_runs[
+        (all_runs.job_type == "cv")
+        & (pd.to_datetime(all_runs.created_at) >= "2026-10-01")
+        & (all_runs.select_metric == "stop/doc_ap")
+    ].copy()
+    sweep_runs["fold"] = sweep_runs.fold.str.removeprefix("fold").astype(int)
+    sweep_runs["config"] = (
+        sweep_runs.model_base.str.split("/").str[-1]
+        + " @ "
+        + sweep_runs.learning_rate.map(lambda lr: f"{lr:.0e}".replace("e-0", "e-"))
+    )
+    sweep_runs = sweep_runs.sort_values(["config", *CASE_FOLD]).reset_index(drop=True)
+    assert (sweep_runs.groupby("config").size() == 20).all(), "Expected 1 run per case-fold per configuration"
+    sweep_runs.groupby("config")[["test/doc_ap", "test/doc_roc_auc", "test/doc_f1", "test/sent_ap"]].mean().round(4)
+    return BASELINE_CONFIG, sweep_runs
 
 
 @app.cell
@@ -235,7 +266,7 @@ def _(mo):
       single run drives the 0.117 seed SD. Use this metric as a collapse detector, not a comparison metric.
     - **Going forward, lead with `test/doc_ap`.** It's threshold-free like ROC AUC, but responds to the rare
       positives instead of the many easy negatives. `train.py` now logs `test/doc_ap` and `test/sent_ap`, and selects
-      checkpoints and attempts on `stop/doc_ap`. Rerun this cell on those runs to confirm AP's noise is comparable.
+      checkpoints and attempts on `stop/doc_ap`. Q5 measures AP's noise on the sweep runs.
     """)
     return
 
@@ -331,8 +362,8 @@ def _(mo):
       rather than selecting among them (Q3 shows how much that tightens a comparison).
     - **Full CV (thresholds):** use 1 attempt. Keep it the same as the final run, because `thresholds.json` assumes
       the final model's scores come from the same procedure as the CV models'.
-    - **Final:** use 1 attempt, unless AP selection turns out to work (rerun Q2 on AP-selected runs) or ensembling
-      is tested. The baseline runs can't test ensembling: only the selected attempt's predictions are kept.
+    - **Final:** use 1 attempt, unless ensembling is tested. The baseline runs can't test ensembling: only the
+      selected attempt's predictions are kept. Q5 finds that AP doesn't make the stopping slice a better judge.
     """)
     return
 
@@ -361,7 +392,7 @@ def _(mo):
 
 
 @app.cell
-def _(CASE_FOLD, np, pd):
+def _(CASE_FOLD, np):
     def paired_comparison(runs_a, runs_b, metric, n_resamples=20_000, seed=0) -> dict:
         """
         Compares two configurations run on the same case-folds. Each argument has one row per case-fold, or several
@@ -504,7 +535,7 @@ def _(HISTORY_CACHE_DIR, WANDB_PROJECT, cv_runs, pd, wandb):
         return history
 
     stop_histories = {run_id: load_stop_history(run_id) for run_id in cv_runs.run_id}
-    return (stop_histories,)
+    return load_stop_history, stop_histories
 
 
 @app.cell
@@ -636,8 +667,406 @@ def _(mo):
       metrics (`stop/*`, `attempt_stop_*`) as evidence for decisions like choosing a base model. Use the `test/`
       metrics, paired across folds.
     - **The root cause is size, not the statistic.** A 10% slice of one case's training pool has too few positive
-      docs to separate near-equal models. Switching selection to `stop/doc_ap` makes it less jumpy, but it may not
-      help much. Rerun this section on AP-selected runs before trusting attempt selection again.
+      docs to separate near-equal models. Q5 checks `stop/doc_ap`: it's no less jumpy, and it can't rank
+      configurations either.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Q5: Revisiting Q1–Q4 with average precision
+
+    The baseline runs predate AP logging, and the sweep has only one attempt per configuration, so Q1–Q4 can't be
+    rerun unchanged. Three substitutes:
+
+    - **Did the switch to AP selection change anything?** Apart from AP checkpoint selection and sentence-AP early
+      stopping (plus collapse retries, which never fired), the sweep's `bert-base-uncased @ 5e-4` runs repeat the
+      baseline's procedure with attempt 0's seed. Pairing them with the baseline's attempt 0 isolates that change.
+    - **How noisy is AP?** BERT's three LRs perform the same (Q6), so they stand in for Q1's seeds as three
+      replicates per case-fold. Any real LR effect inflates the replicate SD, which makes it an upper bound on seed
+      noise. As a check, on doc ROC AUC the LR replicates' SD (about 0.012) is below the baseline's seed SD (0.017).
+    - **Can the stopping slice rank models?** Q2's selection statistics with the 7 configurations in place of
+      attempts.
+    """)
+    return
+
+
+@app.cell
+def _(BASELINE_CONFIG, cv_runs, paired_comparison, pd, sweep_runs):
+    # Positive deltas favor the AP-selected sweep runs
+    pd.DataFrame(
+        {
+            m: paired_comparison(sweep_runs[sweep_runs.config == BASELINE_CONFIG], cv_runs[cv_runs.attempt == 0], m)
+            for m in ["test/doc_roc_auc", "test/doc_f1", "test/sent_roc_auc", "test/sent_f1_pos"]
+        }
+    ).T
+    return
+
+
+@app.cell
+def _(CASE_FOLD, np, pd, sweep_runs):
+    bert_lr_runs = sweep_runs[sweep_runs.model_base == "bert-base-uncased"]
+
+    def replicate_components(runs, metric) -> dict:
+        """Q1's variance components and Q3's 1-attempt noise floor, with whatever varies within a case-fold as the
+        replicates"""
+        n_reps = runs.groupby(CASE_FOLD).size().max()
+        rep_var = runs.groupby(CASE_FOLD)[metric].var().mean()
+        fold_means = runs.groupby(CASE_FOLD)[metric].mean()
+        fold_var = max(fold_means.groupby("case_id").var().mean() - rep_var / n_reps, 0.0)
+        n = runs.groupby(CASE_FOLD).ngroups
+        return dict(
+            mean=runs[metric].mean(),
+            replicate_sd=np.sqrt(rep_var),
+            fold_sd=np.sqrt(fold_var),
+            case_sd=runs.groupby("case_id")[metric].mean().std(),
+            noise_floor_k1=2.8 * np.sqrt(2 * rep_var) / np.sqrt(n),
+        )
+
+    pd.DataFrame(
+        {
+            m: replicate_components(bert_lr_runs, m)
+            for m in ["test/doc_ap", "test/doc_roc_auc", "test/doc_f1", "test/sent_ap", "test/sent_roc_auc"]
+        }
+    ).T.round(4)
+    return (bert_lr_runs,)
+
+
+@app.cell
+def _(demean, pd, sweep_runs):
+    # Do the metrics agree on which configuration did better on the same case-fold? Spearman, all 140 sweep runs
+    _cols = ["test/doc_ap", "test/doc_roc_auc", "test/doc_f1", "test/sent_ap"]
+    pd.DataFrame({c: demean(sweep_runs, c) for c in _cols}).corr(method="spearman").round(3)
+    return
+
+
+@app.cell
+def _(demean, load_stop_history, np, pd, selection_stats, sweep_runs):
+    _ranking = pd.DataFrame(
+        {
+            m: selection_stats(sweep_runs, m, score_col="attempt_stop_doc_ap")
+            for m in ["test/doc_ap", "test/doc_roc_auc"]
+        }
+    ).T
+    _ranking["chance"] = 1 / sweep_runs.config.nunique()
+    # Rank correlation too: Pearson's r is dominated by the few configurations that miss badly on case 214
+    _ranking["within_fold_spearman"] = [
+        pd.concat([demean(sweep_runs, "attempt_stop_doc_ap"), demean(sweep_runs, m)], axis=1)
+        .corr(method="spearman")
+        .iloc[0, 1]
+        for m in _ranking.index
+    ]
+
+    _stop_keys = ["stop/doc_f1", "stop/doc_roc_auc", "stop/doc_ap"]
+    _jumps = pd.DataFrame(
+        [
+            {k: np.abs(np.diff(h[k].to_numpy())).mean() for k in _stop_keys}
+            for h in (load_stop_history(r).sort_values("train/global_step") for r in sweep_runs.run_id)
+        ]
+    ).mean()
+    # A jump only matters relative to the differences being measured, so scale by the spread of the test metric
+    _test_sd = pd.Series({k: sweep_runs[k.replace("stop/", "test/")].std() for k in _stop_keys})
+    _curse = (sweep_runs.attempt_stop_doc_ap - sweep_runs["test/doc_ap"]).mean()
+    stop_slice_stats = dict(
+        ranking=_ranking.round(4),
+        jumps=pd.DataFrame({"mean abs jump": _jumps, "test SD": _test_sd, "ratio": _jumps / _test_sd}).round(3),
+        curse=_curse,
+    )
+    return (stop_slice_stats,)
+
+
+@app.cell
+def _(mo, stop_slice_stats):
+    mo.vstack(
+        [
+            mo.md("**Stopping-slice `doc_ap` as a selector among the 7 configurations** (Q2's statistics)"),
+            stop_slice_stats["ranking"],
+            mo.md(
+                "**Stopping-slice jumpiness** (consecutive doc evals, sweep runs). Optimism of the checkpoint's "
+                f"`stop/doc_ap` over its `test/doc_ap` (winner's curse): {stop_slice_stats['curse']:+.3f}"
+            ),
+            stop_slice_stats["jumps"],
+        ]
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### Q5 takeaways
+
+    - **Switching to AP selection changed nothing measurable.** Against the baseline's attempt 0 (same seed), doc ROC
+      AUC moved +0.005 (p = 0.58) and doc F1 +0.010 (p = 0.33), each improving on 2 of 4 cases. It cost nothing, and
+      it lets selection use the headline metric, so keep it.
+    - **`test/doc_ap` is noisy.** Its replicate SD (0.029) is close to its fold SD (0.034), so it separates folds
+      less well than doc ROC AUC does. Its 1-attempt noise floor is about **0.026**, against about 0.015 for doc ROC
+      AUC.
+    - **It's still the right headline for comparing models.** AP's case SD (0.13) is the largest of any metric, and
+      in Q6 its paired deltas are more consistent relative to their spread than doc ROC AUC's. Within a case-fold,
+      AP and ROC AUC correlate only 0.72, so they often disagree. AP weighs the top of the ranking, where the
+      high-precision production thresholds sit, so prefer it when they conflict, but report both.
+    - **The stopping slice can flag large misses, but it can't rank close models.** Across the 7 configurations,
+      `stop/doc_ap` has a within-fold Pearson correlation of 0.27 with `test/doc_ap` (p = 0.001), but that comes
+      from case 214, where some configurations miss by 0.1 or more. Without case 214 it's 0.03, and the rank
+      correlation is 0.07 overall. Picking each case-fold's configuration by `stop/doc_ap` gained +0.010 ± 0.007
+      doc AP over a random pick, which isn't significant. This reconfirms Q4: don't choose a base model, LR or
+      attempt from `stop/*` metrics.
+    - **AP doesn't make the stopping slice less jumpy.** Relative to each metric's spread, consecutive `stop/doc_ap`
+      evals move about as much as `stop/doc_f1` ones, and the chosen checkpoint's `stop/doc_ap` overstates its
+      `test/doc_ap` by about 0.06.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Q6: Which base model (and LR)?
+
+    Every configuration is compared with `paired_comparison` against one of two BERT references:
+
+    - **`bert-base-uncased @ 5e-4`:** the same LR the other base models used.
+    - **`bert (3 LRs)`:** the mean of BERT's three LRs per case-fold. LR makes no detectable difference for BERT
+      (first table), so averaging the three is a less noisy reference, like Q3's attempt averaging.
+
+    Each configuration has 1 seed, and every non-BERT model ran at 5e-4, so a model that prefers another LR is at a
+    disadvantage here.
+    """)
+    return
+
+
+@app.cell
+def _(bert_lr_runs, paired_comparison, pd):
+    def compare_lrs(metric) -> pd.DataFrame:
+        by_lr = {
+            lr: bert_lr_runs[bert_lr_runs.learning_rate == lr] for lr in sorted(bert_lr_runs.learning_rate.unique())
+        }
+        lrs = list(by_lr)
+        return pd.DataFrame(
+            {
+                f"{a:.0e} vs {b:.0e}".replace("e-0", "e-"): paired_comparison(by_lr[a], by_lr[b], metric)
+                for i, a in enumerate(lrs)
+                for b in lrs[i + 1 :]
+            }
+        ).T
+
+    pd.concat({m: compare_lrs(m) for m in ["test/doc_ap", "test/doc_roc_auc"]}, names=["metric", "pair"])
+    return
+
+
+@app.cell
+def _(BASELINE_CONFIG, bert_lr_runs, paired_comparison, pd, sweep_runs):
+    other_configs = sorted(c for c in sweep_runs.config.unique() if not c.startswith("bert-base-uncased"))
+    references = {BASELINE_CONFIG: sweep_runs[sweep_runs.config == BASELINE_CONFIG], "bert (3 LRs)": bert_lr_runs}
+
+    def compare_to_bert(metric) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                (config, ref_name): paired_comparison(sweep_runs[sweep_runs.config == config], ref_runs, metric)
+                for config in other_configs
+                for ref_name, ref_runs in references.items()
+            }
+        ).T
+
+    base_model_tables = {
+        m: compare_to_bert(m) for m in ["test/doc_ap", "test/doc_roc_auc", "test/doc_f1", "test/sent_ap"]
+    }
+    pd.concat(base_model_tables, names=["metric", "config", "vs"])
+    return base_model_tables, other_configs
+
+
+@app.cell
+def _(CASE_COLORS, base_model_tables, other_configs, plt):
+    def plot_base_model_deltas(tables, configs, metrics=("test/doc_ap", "test/doc_roc_auc"), ref="bert (3 LRs)"):
+        case_markers = ["o", "s", "^", "D"]
+        fig, axes = plt.subplots(1, len(metrics), figsize=(11, 0.6 * len(configs) + 1.6), sharey=True)
+        for ax, metric in zip(axes, metrics):
+            for y, config in enumerate(configs):
+                row = tables[metric].loc[(config, ref)]
+                ax.plot([row.ci_low, row.ci_high], [y, y], color="#555555", lw=2, solid_capstyle="round", zorder=1)
+                ax.scatter(row.mean_delta, y, marker="|", s=320, color="#222222", lw=2.5, zorder=3)
+                for (case_id, delta), color, marker in zip(row.per_case.items(), CASE_COLORS, case_markers):
+                    ax.scatter(
+                        delta,
+                        y + 0.18,
+                        color=color,
+                        marker=marker,
+                        s=46,
+                        edgecolors="white",
+                        lw=1,
+                        zorder=2,
+                        label=f"case {case_id}" if y == 0 else None,
+                    )
+            ax.axvline(0, color="#999999", lw=0.8)
+            ax.set_title(metric, fontsize=10)
+            ax.set_xlabel(f"difference vs {ref}")
+            ax.set_yticks(range(len(configs)), configs)
+            ax.set_ylim(len(configs) - 0.4, -0.6)  # inverted, with room for the case markers
+            ax.grid(axis="y", visible=False)
+        axes[-1].legend(fontsize=8, loc="lower left")
+        fig.suptitle(
+            "Base models vs BERT: mean difference (tick) with 95% CI (line), and each case's mean (markers)",
+            fontsize=11,
+        )
+        fig.tight_layout()
+        return fig
+
+    plot_base_model_deltas(base_model_tables, other_configs)
+    return
+
+
+@app.cell
+def _(CASE_FOLD, mo, sweep_runs):
+    # Rank of each configuration among the 7 on every case-fold (1 = best test/doc_ap)
+    _ranks = sweep_runs.assign(rank=sweep_runs.groupby(CASE_FOLD)["test/doc_ap"].rank(ascending=False))
+    _rank_table = _ranks.groupby("config")["rank"].agg(["mean", "median"]).sort_values("mean")
+
+    # The runs furthest below the other configurations on the same case-fold
+    _shortfall = sweep_runs["test/doc_ap"] - sweep_runs.groupby(CASE_FOLD)["test/doc_ap"].transform("median")
+    _worst = sweep_runs.assign(shortfall_vs_median=_shortfall).nsmallest(5, "shortfall_vs_median")[
+        [
+            "config",
+            "case_id",
+            "fold",
+            "test/doc_ap",
+            "shortfall_vs_median",
+            "test/doc_roc_auc",
+            "test/sent_f1_pos",
+            "attempt_stop_doc_ap",
+        ]
+    ]
+    mo.vstack(
+        [
+            mo.md("**Mean rank on `test/doc_ap` among the 7 configurations** (1 = best)"),
+            _rank_table.round(2),
+            mo.md("**The 5 runs furthest below the median configuration on their case-fold**"),
+            _worst.round(3),
+        ]
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### Q6 takeaways
+
+    - **LR doesn't matter for BERT between 2e-4 and 1e-3.** No pair of LRs differs significantly on doc AP or doc ROC
+      AUC (all p ≥ 0.33), and the per-case differences go both ways. Keep 5e-4; there's no reason to sweep it again.
+    - **No alternative base model beats BERT.** Against BERT's three LRs, every alternative is lower on doc AP, by
+      0.015 (PrivBERT) to 0.023 (DeBERTa-v3), and each improves on at most 2 of 4 cases. That's significant for
+      legal-bert (p = 0.01) and PrivBERT (p = 0.03), borderline for RoBERTa (p = 0.06) and not for DeBERTa
+      (p = 0.32). These are near the 0.026 noise floor (Q5), so "no better than BERT" is a safer reading than
+      "worse than BERT", except for legal-bert.
+    - **Case 214 accounts for most of the gap.** Every alternative loses 0.035–0.106 doc AP there, against BERT's
+      0.65. Elsewhere the alternatives are roughly even with BERT.
+    - **Domain pretraining didn't help.** Neither legal-bert (legal text) nor PrivBERT (privacy policies) gained on
+      any metric. PrivBERT is the closest contender: it's the only model level with BERT on doc ROC AUC, but it does
+      worse among its top-scored docs, which is what the high-precision thresholds depend on.
+    - **DeBERTa-v3 is erratic.** It has the best doc AP on case 203 (+0.04 vs BERT at 5e-4), and the worst run in
+      the sweep: 214/fold4 scored 0.35 doc AP and 0.70 doc ROC AUC. Its stopping-slice doc AP was a normal-looking
+      0.68, and its sentence model still predicted positives, so neither the stopping slice nor the collapse check
+      flagged it.
+    - **Decision:** use `bert-base-uncased @ 5e-4` for v4.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Q7: Which kinds of negatives does the model call positive?
+
+    Each training example comes from one source (`make_classification_datasets.py`), and the test metrics log the
+    share of each source's test-fold examples predicted positive. For `approved`, the positives, that share is
+    recall. For the negative sources it's the false positive rate. Shown for `bert-base-uncased @ 5e-4` only.
+
+    - **Document level:** `declined` = docs with a declined point for the case; `reviewed` = comprehensively
+      reviewed docs with no point for the case.
+    - **Sentence level:** `declined` = declined point spans; `surrounding` = spans just before or after a positive;
+      `topical` = approved points from other cases in the same topic; `doc_random` = random spans from docs with an
+      approved point; `reviewed_random` = random spans from reviewed docs.
+
+    The two levels use different cutoffs, so compare sources within a panel, not across panels. Doc-level labels
+    use the F1-optimal threshold fit on the fold itself (see `DOC_PRED_COLS` in `train.py`); sentence-level labels
+    use a fixed 0.5.
+    """)
+    return
+
+
+@app.cell
+def _(BASELINE_CONFIG, CASE_COLORS, plt, sweep_runs):
+    def plot_pos_rates(runs):
+        case_markers = ["o", "s", "^", "D"]
+        cases = sorted(runs.case_id.unique())
+        levels = {"doc": ["approved", "declined", "reviewed"], "sent": ["approved", "declined"]}
+        # Order the remaining sentence negatives by their mean rate, highest first
+        sent_rest = ["surrounding", "topical", "doc_random", "reviewed_random"]
+        levels["sent"] += sorted(sent_rest, key=lambda src: -runs[f"test/sent_pos_rate_{src}"].mean())
+        fig, axes = plt.subplots(
+            2, 1, figsize=(9, 6.2), sharex=True, gridspec_kw=dict(height_ratios=[len(v) for v in levels.values()])
+        )
+        offsets = [-0.24, -0.08, 0.08, 0.24]
+        for ax, (level, sources) in zip(axes, levels.items()):
+            for y, source in enumerate(sources):
+                col = f"test/{level}_pos_rate_{source}"
+                for case_id, color, marker, dy in zip(cases, CASE_COLORS, case_markers, offsets):
+                    rates = runs.loc[runs.case_id == case_id, col]
+                    ax.scatter(rates, [y + dy] * len(rates), color=color, marker=marker, s=14, alpha=0.35, lw=0)
+                    ax.scatter(
+                        rates.mean(),
+                        y + dy,
+                        color=color,
+                        marker=marker,
+                        s=60,
+                        edgecolors="white",
+                        lw=1,
+                        zorder=3,
+                        label=f"case {case_id}" if (level == "doc" and y == 0) else None,
+                    )
+            labels = ["approved (recall)" if src == "approved" else src for src in sources]
+            ax.set_yticks(range(len(sources)), labels)
+            ax.axhline(0.5, color="#999999", lw=0.8)  # separates the positives from the negative sources
+            ax.set_ylim(len(sources) - 0.5, -0.5)
+            ax.grid(axis="y", visible=False)
+            ax.set_title(f"{level}-level sources", fontsize=10, loc="left")
+        axes[-1].set_xlim(-0.02, 1.02)
+        axes[-1].set_xlabel("share of the source's test-fold examples predicted positive")
+        axes[0].legend(fontsize=8, loc="lower right")
+        fig.suptitle(
+            f"Positive prediction rate by source, {BASELINE_CONFIG} (large = case mean, small = each fold)", fontsize=11
+        )
+        fig.tight_layout()
+        return fig
+
+    plot_pos_rates(sweep_runs[sweep_runs.config == BASELINE_CONFIG])
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### Q7 takeaways
+
+    - **`declined` is by far the most confused negative source.** At sentence level the model calls about half of
+      declined spans positive on cases 203, 288 and 377 (0.51–0.54), against at most 0.11 for any other negative
+      source. Doc-level rates are similar (0.58–0.67). That fits declined points being edge cases that reviewers
+      disagreed on. Each fold has only a handful of declined examples (fold values land on fractions like 1/3 and
+      1/2), so trust the case means more than the per-fold spread.
+    - **Case 214 is the exception.** Only 0.16 of its declined docs and 0.19 of its declined spans are predicted
+      positive, but its recall is also the lowest (0.74 at doc level). Its model is more conservative overall,
+      which fits its being the hardest case in Q6.
+    - **`topical` is the next hardest, and it varies by case** (0.02–0.11). It's highest on case 214, whose topic
+      neighbors are evidently close in wording. `surrounding` spans are rarely confused (≤ 0.03), so the model
+      separates the evidence from its context well.
+    - **Random spans are almost never predicted positive** (≤ 0.012), so the easy negatives contribute little to
+      the false positives.
+    - **The doc-level `reviewed` rate is about 0.10 on every case.** That's at least partly an artifact of the
+      per-fold F1-optimal threshold. Some of these may also be real instances that the review missed, the
+      annotation-coverage issue that affects the other cases more.
     """)
     return
 
@@ -647,17 +1076,29 @@ def _(mo):
     mo.md(r"""
     ## Summary and next steps
 
-    1. **Metrics:** use `test/doc_ap` as the headline (`test/doc_roc_auc` for the baseline runs), with `test/doc_f1`
-       as a readable secondary. `test/sent_roc_auc` is saturated. Use `test/sent_f1_pos` only as a collapse detector.
-    2. **Attempts:** use 1 per fold in every mode. The stopping slice can't pick the better seed. If more compute is
-       available, average attempts when comparing configurations, and test ensembling before using it for final
-       models.
+    1. **Metrics:** use `test/doc_ap` as the headline, with `test/doc_roc_auc` beside it and `test/doc_f1` as a
+       readable secondary. Flag comparisons where AP and ROC AUC disagree. `test/sent_roc_auc` is saturated. Use
+       `test/sent_f1_pos` only as a collapse detector.
+    2. **Attempts:** use 1 per fold in every mode. The stopping slice can't pick the better seed or the better
+       model, with F1 or AP. If more compute is available, average attempts when comparing configurations, and test
+       ensembling before using it for final models.
     3. **Significance:** compare configurations with `paired_comparison` on identical case-folds. With 1 attempt per
-       fold, a doc ROC AUC improvement under about 0.015 is noise. Also require the improvement on all four cases.
-    4. **Selection:** `train.py` now selects checkpoints and attempts on `stop/doc_ap` and early-stops on sentence
-       AP. The next CV run should check whether that changes Q2 or Q4, but the stopping slice's size limits what
-       any selection statistic can do.
+       fold, a doc AP improvement under about 0.026 (doc ROC AUC: 0.015) is noise. Also require the improvement on
+       all four cases.
+    4. **Selection:** keep AP checkpoint and attempt selection. It didn't change test results, but it costs nothing
+       and selects on the headline metric.
+    5. **Base model:** use `bert-base-uncased` at LR 5e-4 for v4. The alternatives tried (legal-bert, RoBERTa,
+       PrivBERT, DeBERTa-v3) are no better, and mostly lose on case 214. More base-model search is only worth it as
+       a targeted follow-up: e.g. PrivBERT at a second LR or seed, or ModernBERT.
+    6. **Collapse detection:** DeBERTa's 214/fold4 run failed silently (0.35 doc AP) while predicting positives and
+       looking normal on the stopping slice. Detecting partial failures like this would need a check beyond "no
+       positive predictions".
     """)
+    return
+
+
+@app.cell
+def _():
     return
 
 

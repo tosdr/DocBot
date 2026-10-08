@@ -19,6 +19,7 @@ dependencies = [
     "pytest>=9.0.3",
     "scikit-learn==1.8.*",
     "seaborn>=0.13.2",
+    "sentencepiece>=0.2.2",
     "spacy==3.*",
     "sqlalchemy>=2.0.49",
     "textacy>=0.13.0",
