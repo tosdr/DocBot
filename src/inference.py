@@ -203,20 +203,6 @@ def get_threshold(case_id: int, operating_point: str = DEFAULT_OPERATING_POINT) 
     raise KeyError(f"Operating point {operating_point} not found in {thresholds_path}")
 
 
-def list_case_ids() -> list[int]:
-    """Cases with a production model, judged by the presence of a thresholds.json artifact. Falls back to the
-    legacy THRESHOLDS dict when none exist locally (v3 models)."""
-    models_root = here / f"../data/models/{MODEL_VERSION}"
-    case_ids = set()
-    if models_root.exists():
-        for path in models_root.iterdir():
-            if path.is_dir() and (path / "thresholds.json").exists():
-                case_ids.add(int(path.name))
-    if not case_ids:
-        case_ids = set(THRESHOLDS.keys())
-    return list(sorted(case_ids))
-
-
 def detect_lang(text: str):
     try:
         return langdetect.detect(text)

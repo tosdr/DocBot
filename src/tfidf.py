@@ -2,6 +2,7 @@ import copy
 import logging
 import pickle
 import random
+from argparse import ArgumentParser
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, TypedDict
@@ -17,15 +18,13 @@ from textacy import extract
 from textacy.representations.vectorizers import Vectorizer
 from tqdm import tqdm
 
-from src import inference, utils
+from src import make_classification_datasets, utils
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 here = Path(__file__).parent
 
 DB_DUMP_VERSION = "2026-07-09"
-# We'll only train models for Cases that have deep learning models trained
-CASE_IDS = inference.list_case_ids()
 RANDOM_STATE = 0
 random.seed(RANDOM_STATE)
 
@@ -490,7 +489,7 @@ def make_case_dataset(case_id, positives, negatives):
 
 
 def prep_datasets(
-    documents, points, services, num_negative_docs=600, sents_per_doc=18
+    documents, points, services, case_ids, num_negative_docs=600, sents_per_doc=18
 ) -> tuple[dict[int, pd.DataFrame], pd.DataFrame]:
     """
     :return: make dataframes that can later be refined into datasets of sentences for any Case:
@@ -520,7 +519,7 @@ def prep_datasets(
 
     approved_points = points[points.status == "approved"]
     positives = dict()
-    for case_id in CASE_IDS:
+    for case_id in case_ids:
         approved = approved_points[approved_points.case_id == case_id].copy()
         approved["text"] = approved.quote_text.apply(utils.preprocess_doc_text)
         approved["point_id"] = approved["id"]
@@ -588,7 +587,10 @@ def extract_ngrams(case_dataset):
     return ngrams, sentence_labels
 
 
-def run():
+def run(skip_existing=False):
+    # Same cases the deep learning models are trained on (see sent_spans/train.py)
+    case_ids = sorted(make_classification_datasets.load_sent_span().keys())
+
     documents = pickle.load(open(here / f"../data/db_dumps/{DB_DUMP_VERSION}/documents_clean.pkl", "rb"))
     points = pickle.load(open(here / f"../data/db_dumps/{DB_DUMP_VERSION}/points_clean.pkl", "rb"))
     services = pickle.load(open(here / f"../data/db_dumps/{DB_DUMP_VERSION}/services_clean.pkl", "rb"))
@@ -602,15 +604,23 @@ def run():
     try:
         positives, negatives = pickle.load(open(prep_cache, "rb"))
         logger.info("Loaded prep_datasets from cache")
+        missing = set(case_ids) - set(positives.keys())
+        if missing:
+            logger.info(f"Cache is missing cases {sorted(missing)}, rebuilding")
+            raise FileNotFoundError
     except FileNotFoundError:
         logger.info("Running prep_datasets (this may take a while)")
-        positives, negatives = prep_datasets(documents, points, services)
+        positives, negatives = prep_datasets(documents, points, services, case_ids)
         pickle.dump((positives, negatives), open(prep_cache, "wb"))
 
     critical_recalls = [1.0, 0.98, 0.95]
 
     # Loop over all cases
-    for case_id in CASE_IDS:
+    for case_id in case_ids:
+        model_outdir = model_output_dir(case_id)
+        if skip_existing and model_outdir.exists():
+            logger.info(f"Skipping case {case_id}: {model_outdir} already exists")
+            continue
         logger.info(f"Processing case {case_id}")
 
         # Create dataset for this case
@@ -618,7 +628,6 @@ def run():
         ngrams, sentence_labels = extract_ngrams(case_dataset)
 
         # Train and save results
-        model_outdir = model_output_dir(case_id)
         model_outdir.mkdir(parents=True, exist_ok=True)
         cv_folds = 5
         cv_results = train_cv(ngrams, sentence_labels, model_outdir, critical_recalls, cv_folds)
@@ -630,4 +639,11 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    parser = ArgumentParser(description="Train TF-IDF prefilter models for each case")
+    parser.add_argument(
+        "--skip_existing",
+        action="store_true",
+        help=f"Skip cases whose model dir (data/models/{MODEL_VERSION}/{{case_id}}) already exists",
+    )
+    args = parser.parse_args()
+    run(skip_existing=args.skip_existing)

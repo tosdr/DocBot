@@ -78,3 +78,6 @@ search_path = [
 project-excludes = [
     "src/edtech_research"
 ]
+
+[tool.marimo.runtime]
+pythonpath = ["src"]

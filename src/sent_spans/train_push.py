@@ -1,14 +1,13 @@
-from argparse import ArgumentParser
 import logging
 import os
 import random
 import time
+from argparse import ArgumentParser
 
 import boto3
 
 from src import make_classification_datasets
 from src.sent_spans import TEST_CASE_IDS
-
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,7 +18,7 @@ AWS_REGION = "us-east-1"
 def parallel_queue_name():
     if "AWS_ACCOUNT" not in os.environ:
         raise RuntimeError("Set AWS_ACCOUNT env variable to use parallel training")
-    return f"https://sqs.us-east-1.amazonaws.com/{os.environ['AWS_ACCOUNT']}/tosdr-training.fifo"
+    return f"https://sqs.{AWS_REGION}.amazonaws.com/{os.environ['AWS_ACCOUNT']}/tosdr-training.fifo"
 
 
 def push(case_ids: list, model_version: str, empty_assert_timeout=30):

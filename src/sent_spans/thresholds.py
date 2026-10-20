@@ -26,9 +26,13 @@ For each case we compute a menu of operating points: thresholds targeting severa
 F-beta(1.5) optimum that production (apply_docbot.py) uses. Precision is prevalence-corrected so it estimates
 precision against the production corpus of all documents rather than the constructed eval set:
     P(t) = r(t)*pi / (r(t)*pi + fpr(t)*(1-pi))
-where r(t) is recall on positive docs, fpr(t) is the false positive rate on `reviewed`-source negatives only
-(declined negatives are enriched hard cases and would bias production FPR upward), and pi is the per-case prevalence
-estimated on the fly by compute_case_prevalence (below).
+where r(t) is recall on positive docs, fpr(t) is the false positive rate on production negatives, and pi is the
+per-case prevalence estimated on the fly by compute_case_prevalence (below). fpr(t) is stratified by negative source
+(production_fpr): `reviewed` negatives stand in for the production negatives no curator has flagged for the case, and
+`declined` negatives for the share of them that a curator considered and declined, weighted by that share among
+comprehensively reviewed docs. Declined docs are the hardest negatives and are enriched in the eval set, so pooling them
+unweighted would overstate production FPR, while leaving them out understates it. They also add resolution in the tail,
+where few reviewed negatives score above precision-target thresholds.
 
 Per-fold thresholds are aggregated in logit space because BERT softmax scores saturate near 0/1, making probability-
 space statistics meaningless there. The cross-fold agreement (std of logits) doubles as a trust diagnostic: the
@@ -68,19 +72,43 @@ def _sigmoid(x):
     return 1 / (1 + np.exp(-x))
 
 
-def corrected_pr_curve(pos_scores, neg_scores, prevalence: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _frac_at_or_above(scores, thresholds):
+    """Fraction of `scores` at or above each threshold (0 where there are no scores)"""
+    if len(scores) == 0:
+        return np.zeros(np.shape(thresholds))
+    return 1 - np.searchsorted(np.sort(scores), thresholds, side="left") / len(scores)
+
+
+def production_fpr(thresholds, reviewed_neg, declined_neg, declined_weight: float):
+    """
+    False positive rate against production negatives, stratified by negative source (see module docstring). Falls
+    back to reviewed negatives alone when there are no declined negatives to estimate their stratum from.
+    :param thresholds: a threshold or an array of them
+    :param declined_weight: the declined stratum's share of production negatives (compute_case_prevalence)
+    """
+    fpr = _frac_at_or_above(reviewed_neg, thresholds)
+    if len(declined_neg) == 0 or declined_weight == 0:
+        return fpr
+    return (1 - declined_weight) * fpr + declined_weight * _frac_at_or_above(declined_neg, thresholds)
+
+
+def corrected_pr_curve(
+    pos_scores, reviewed_neg, prevalence: float, declined_neg=None, declined_weight: float = 0.0
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Prevalence-corrected precision-recall curve.
     :param pos_scores: prediction scores of positive docs (recall comes only from these)
-    :param neg_scores: prediction scores of negative docs representative of production negatives
-        (use `reviewed`-source negatives, not the enriched `declined` ones)
+    :param reviewed_neg: prediction scores of `reviewed`-source negatives
     :param prevalence: estimated fraction of production docs that are positive for the case
+    :param declined_neg: prediction scores of `declined`-source negatives, weighted by `declined_weight` in the FPR.
+        Omitted, the FPR comes from reviewed negatives alone.
     :return: (thresholds ascending, recall, corrected precision) as np arrays; precision is nan where no doc scores
         at or above the threshold
     """
-    thresholds = np.unique(np.concatenate([pos_scores, neg_scores]))
-    recall = np.array([(pos_scores >= t).mean() if len(pos_scores) else 0.0 for t in thresholds])
-    fpr = np.array([(neg_scores >= t).mean() if len(neg_scores) else 0.0 for t in thresholds])
+    declined_neg = np.array([]) if declined_neg is None else declined_neg
+    thresholds = np.unique(np.concatenate([pos_scores, reviewed_neg, declined_neg]))
+    recall = _frac_at_or_above(pos_scores, thresholds)
+    fpr = production_fpr(thresholds, reviewed_neg, declined_neg, declined_weight)
 
     denom = recall * prevalence + fpr * (1 - prevalence)
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -108,8 +136,11 @@ def _threshold_for_fbeta(thresholds, recall, precision, beta: float) -> float | 
     return float(thresholds[np.argmax(fscore)])
 
 
-def _metrics_at_threshold(threshold: float, fold_scores: list[dict], prevalence: float) -> dict:
-    """Mean recall / corrected precision / raw (eval-set, all negatives) precision across folds at a fixed threshold"""
+def _metrics_at_threshold(
+    threshold: float, fold_scores: list[dict], prevalence: float, declined_weight: float = 0.0
+) -> dict:
+    """Mean recall / corrected precision / raw (eval-set, all negatives) precision across folds at a fixed threshold.
+    With declined_weight 0 the corrected precision's FPR comes from reviewed negatives alone."""
     recalls, corrected, raw = [], [], []
     for fold in fold_scores:
         pos, reviewed_neg, all_neg = fold["pos"], fold["reviewed_neg"], fold["all_neg"]
@@ -118,7 +149,7 @@ def _metrics_at_threshold(threshold: float, fold_scores: list[dict], prevalence:
         r = (pos >= threshold).mean()
         recalls.append(r)
         if len(reviewed_neg) > 0:
-            fpr = (reviewed_neg >= threshold).mean()
+            fpr = float(production_fpr(threshold, reviewed_neg, fold["declined_neg"], declined_weight))
             denom = r * prevalence + fpr * (1 - prevalence)
             if denom > 0:
                 corrected.append(r * prevalence / denom)
@@ -154,6 +185,7 @@ def _aggregate_operating_point(
     per_fold_thresholds: list[float | None],
     fold_scores: list[dict],
     prevalence: float,
+    declined_weight: float,
     target_precision: float | None = None,
 ) -> dict:
     valid = [t for t in per_fold_thresholds if t is not None]
@@ -169,12 +201,13 @@ def _aggregate_operating_point(
     threshold = float(_sigmoid(threshold_logit))
 
     op.update({"threshold": threshold, "mean_logit": mean_logit, "std_logit": std_logit, "stable": stable})
-    op.update(_metrics_at_threshold(threshold, fold_scores, prevalence))
+    op.update(_metrics_at_threshold(threshold, fold_scores, prevalence, declined_weight))
     return op
 
 
 def _fold_scores(doc_pred_df: pd.DataFrame, case_id: int) -> list[dict[str, Any]]:
-    """Splits out-of-fold doc scores by fold into positives, reviewed-source negatives and all negatives"""
+    """Splits out-of-fold doc scores by fold into positives, reviewed- and declined-source negatives, and all
+    negatives"""
     df = doc_pred_df[doc_pred_df.pred_score.notna()]
     if len(df) < len(doc_pred_df):
         logger.warning(f"Case {case_id}: {len(doc_pred_df) - len(df)} docs are missing a pred_score")
@@ -188,6 +221,7 @@ def _fold_scores(doc_pred_df: pd.DataFrame, case_id: int) -> list[dict[str, Any]
                 "fold": int(fold_i),
                 "pos": fold_df[fold_df.label == "positive"].pred_score.values,
                 "reviewed_neg": negatives[negatives.source == "reviewed"].pred_score.values,
+                "declined_neg": negatives[negatives.source == "declined"].pred_score.values,
                 "all_neg": negatives.pred_score.values,
             }
         )
@@ -195,7 +229,7 @@ def _fold_scores(doc_pred_df: pd.DataFrame, case_id: int) -> list[dict[str, Any]
 
 
 def _per_fold_operating_points(
-    fold_scores: list[dict], prevalence: float, case_id: int
+    fold_scores: list[dict], prevalence: float, declined_weight: float, case_id: int
 ) -> list[tuple[str, float | None, list[float | None]]]:
     """
     Each operating point's threshold picked independently on every fold's prevalence-corrected PR curve.
@@ -208,7 +242,9 @@ def _per_fold_operating_points(
             logger.warning(f"Case {case_id} fold {fold['fold']}: no positives or no reviewed negatives, skipping fold")
             fold_curves.append(None)
         else:
-            fold_curves.append(corrected_pr_curve(fold["pos"], fold["reviewed_neg"], prevalence))
+            fold_curves.append(
+                corrected_pr_curve(fold["pos"], fold["reviewed_neg"], prevalence, fold["declined_neg"], declined_weight)
+            )
 
     fbeta_folds = [_threshold_for_fbeta(*curve, FSCORE_BETA) if curve is not None else None for curve in fold_curves]
     points: list[tuple[str, float | None, list[float | None]]] = [("fbeta15", None, fbeta_folds)]
@@ -224,11 +260,11 @@ def compute_case_thresholds(doc_pred_df: pd.DataFrame, prevalence_entry: dict, c
     :param prevalence_entry: this case's entry from compute_case_prevalence()
     :return: the thresholds.json artifact contents (see module docstring)
     """
-    prevalence = prevalence_entry["prevalence"]
+    prevalence, declined_weight = prevalence_entry["prevalence"], prevalence_entry["declined_weight"]
     fold_scores = _fold_scores(doc_pred_df, case_id)
     operating_points = [
-        _aggregate_operating_point(name, per_fold, fold_scores, prevalence, target_precision=target)
-        for name, target, per_fold in _per_fold_operating_points(fold_scores, prevalence, case_id)
+        _aggregate_operating_point(name, per_fold, fold_scores, prevalence, declined_weight, target_precision=target)
+        for name, target, per_fold in _per_fold_operating_points(fold_scores, prevalence, declined_weight, case_id)
     ]
 
     stable = all(op["stable"] for op in operating_points if op["attainable"])
@@ -244,6 +280,8 @@ def compute_case_thresholds(doc_pred_df: pd.DataFrame, prevalence_entry: dict, c
         "prevalence": prevalence,
         "n_reviewed": prevalence_entry["n_reviewed"],
         "n_positive": prevalence_entry["n_positive"],
+        "n_declined": prevalence_entry["n_declined"],
+        "declined_weight": declined_weight,
         "stable": stable,
         "dataset_version": make_classification_datasets.LATEST_VERSION,
         "operating_points": operating_points,
@@ -285,7 +323,7 @@ CALIBRATION_RULES = {
 }
 
 
-def leave_one_fold_out(doc_pred_df: pd.DataFrame, prevalence: float, case_id: int, rules=None) -> pd.DataFrame:
+def leave_one_fold_out(doc_pred_df: pd.DataFrame, prevalence_entry: dict, case_id: int, rules=None) -> pd.DataFrame:
     """
     Evaluates threshold aggregation rules the way production uses them: per-fold thresholds from all folds but one
     are aggregated, and the result is applied to the held-out fold's scores. Those scores come from a model the
@@ -298,12 +336,14 @@ def leave_one_fold_out(doc_pred_df: pd.DataFrame, prevalence: float, case_id: in
     - recall / corrected_precision / raw_precision realized on the held-out fold, and precision_shortfall
       (target - corrected precision; positive means the target was missed). corrected_precision is nan when nothing
       scores above the threshold
-    - n_pos / n_reviewed_neg and the counts above threshold, to judge how much each realized precision can be trusted
+    - n_pos / n_reviewed_neg / n_declined_neg and the counts above threshold, to judge how much each realized precision
+      can be trusted
     """
     rules = CALIBRATION_RULES if rules is None else rules
+    prevalence, declined_weight = prevalence_entry["prevalence"], prevalence_entry["declined_weight"]
     fold_scores = _fold_scores(doc_pred_df, case_id)
     rows = []
-    for name, target, per_fold in _per_fold_operating_points(fold_scores, prevalence, case_id):
+    for name, target, per_fold in _per_fold_operating_points(fold_scores, prevalence, declined_weight, case_id):
         for i, held_out in enumerate(fold_scores):
             if len(held_out["pos"]) == 0 or len(held_out["reviewed_neg"]) == 0:
                 continue
@@ -324,13 +364,14 @@ def leave_one_fold_out(doc_pred_df: pd.DataFrame, prevalence: float, case_id: in
                 "held_out_ideal_logit": ideal_logit,
                 "n_pos": len(held_out["pos"]),
                 "n_reviewed_neg": len(held_out["reviewed_neg"]),
+                "n_declined_neg": len(held_out["declined_neg"]),
             }
             for rule_name, rule in rules.items():
                 threshold_logit = rule(logits)
                 if threshold_logit is None:
                     continue
                 threshold = float(_sigmoid(threshold_logit))
-                metrics = _metrics_at_threshold(threshold, [held_out], prevalence)
+                metrics = _metrics_at_threshold(threshold, [held_out], prevalence, declined_weight)
                 precision = metrics["corrected_precision"]
                 rows.append(
                     {
@@ -347,6 +388,7 @@ def leave_one_fold_out(doc_pred_df: pd.DataFrame, prevalence: float, case_id: in
                         else np.nan,
                         "n_pos_above": int((held_out["pos"] >= threshold).sum()),
                         "n_reviewed_neg_above": int((held_out["reviewed_neg"] >= threshold).sum()),
+                        "n_declined_neg_above": int((held_out["declined_neg"] >= threshold).sum()),
                     }
                 )
     return pd.DataFrame(rows)
@@ -358,16 +400,20 @@ def compute_case_prevalence(documents, points, comprehensive_threshold: int, en_
     make_classification_datasets.make_doc_datasets), the fraction that have an approved point for the case. Used to
     convert eval-set precision into an estimate of precision against the production corpus of all documents.
     Computed on the fly from the cleaned DB dumps rather than serialized, so it can't go stale.
-    Caveat: comprehensively reviewed docs skew toward popular services, so this is a proxy, not corrected for that
+    Also estimates the declined stratum's share of production negatives (declined_weight for production_fpr): among
+    comprehensively reviewed docs without an approved point for the case, the fraction with a declined one.
+    Caveat: comprehensively reviewed docs skew toward popular services, so these are proxies, not corrected for that
     sampling bias.
 
-    :return: dict from case id to {'prevalence': float, 'n_reviewed': int, 'n_positive': int}
+    :return: dict from case id to
+        {'prevalence': float, 'n_reviewed': int, 'n_positive': int, 'n_declined': int, 'declined_weight': float}
     """
     if en_only:
         documents = documents[documents.lang == "en"].copy()
         points = points[points.lang == "en"].copy()
 
     approved_points = points[points.status == "approved"]
+    declined_points = points[points.status == "declined"]
     point_counts = approved_points.document_id.value_counts()
     documents.loc[point_counts.index, "num_approved"] = point_counts
     reviewed_doc_ids = set(
@@ -382,10 +428,14 @@ def compute_case_prevalence(documents, points, comprehensive_threshold: int, en_
     for case_id in case_num_approved[case_num_approved >= make_classification_datasets.MIN_APPROVED].index:
         case_doc_ids = set(approved_points[approved_points.case_id == case_id].document_id)
         n_positive = len(case_doc_ids & reviewed_doc_ids)
+        declined_doc_ids = set(declined_points[declined_points.case_id == case_id].document_id) - case_doc_ids
+        n_declined = len(declined_doc_ids & reviewed_doc_ids)
         prevalence[int(case_id)] = {
             "prevalence": n_positive / len(reviewed_doc_ids),
             "n_reviewed": len(reviewed_doc_ids),
             "n_positive": n_positive,
+            "n_declined": n_declined,
+            "declined_weight": n_declined / (len(reviewed_doc_ids) - n_positive),
         }
     return prevalence
 
@@ -415,8 +465,9 @@ def calibrate(model_version: str) -> pd.DataFrame:
         if case_id not in prevalence:
             logger.warning(f"Case {case_id} has no prevalence estimate, skipping")
             continue
-        case_df = leave_one_fold_out(doc_pred_df, prevalence[case_id]["prevalence"], case_id)
+        case_df = leave_one_fold_out(doc_pred_df, prevalence[case_id], case_id)
         case_df["prevalence"] = prevalence[case_id]["prevalence"]
+        case_df["declined_weight"] = prevalence[case_id]["declined_weight"]
         frames.append(case_df)
     calibration = pd.concat(frames, ignore_index=True)
 
