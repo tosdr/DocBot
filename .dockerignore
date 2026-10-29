@@ -1,9 +1,9 @@
 .venv
 .git
 data
-!data/db_dumps/2026-07-09/sent_span_classification_v*.pkl
-!data/db_dumps/2026-07-09/doc_classification_v*.pkl
-!data/models/tfidf_v2
+!data/db_dumps/2026-10-20/sent_span_classification_v*.pkl
+!data/db_dumps/2026-10-20/doc_classification_v*.pkl
+!data/models/tfidf_v3
 logs
 wandb
 notebooks

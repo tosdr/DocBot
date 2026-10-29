@@ -8,7 +8,6 @@ from typing import Any
 import boto3
 import numpy as np
 import pandas as pd
-from scipy import stats
 
 from src import inference, make_classification_datasets
 from src.sent_spans import RESULTS_S3_BUCKET, train_push
@@ -18,65 +17,54 @@ logger = logging.getLogger(__name__)
 here = Path(__file__).parent
 
 """
-Selects decision thresholds for the sent-span case models from cross-validation results (the out-of-fold doc-level
-predictions produced by train.py with all folds). This replaces the notebook-based F-beta threshold picking that fed
-inference.THRESHOLDS.
+Selects decision thresholds for the sent-span case models from their test-split doc predictions (train.py output). The
+model that scored the test split is the one that ships, so thresholds are chosen on the exact weights production runs.
 
 For each case we compute a menu of operating points: thresholds targeting several precision levels, plus the
 F-beta(1.5) optimum that production (apply_docbot.py) uses. Precision is prevalence-corrected so it estimates
-precision against the production corpus of all documents rather than the constructed eval set:
+precision against the production corpus of all documents rather than the constructed test set:
     P(t) = r(t)*pi / (r(t)*pi + fpr(t)*(1-pi))
 where r(t) is recall on positive docs, fpr(t) is the false positive rate on production negatives, and pi is the
 per-case prevalence estimated on the fly by compute_case_prevalence (below). fpr(t) is stratified by negative source
 (production_fpr): `reviewed` negatives stand in for the production negatives no curator has flagged for the case, and
 `declined` negatives for the share of them that a curator considered and declined, weighted by that share among
-comprehensively reviewed docs. Declined docs are the hardest negatives and are enriched in the eval set, so pooling them
-unweighted would overstate production FPR, while leaving them out understates it. They also add resolution in the tail,
-where few reviewed negatives score above precision-target thresholds.
+comprehensively reviewed docs. Declined docs are the hardest negatives and are enriched in the test set, so pooling them
+unweighted would overstate production FPR, while leaving them out understates it.
 
-Per-fold thresholds are aggregated in logit space because BERT softmax scores saturate near 0/1, making probability-
-space statistics meaningless there. The cross-fold agreement (std of logits) doubles as a trust diagnostic: the
-recommended threshold for the final full-data model is sigmoid(mean + CONSERVATIVE_K * std) when folds agree, and the
-most conservative (max) fold threshold with `stable: false` flagged when they don't.
+Picking the lowest threshold whose estimated precision meets a target, on the same docs that precision is estimated
+from, favors thresholds that got lucky. At high targets the estimate also rests on zero or one negatives above the
+threshold, out of ~140, which says little about the true FPR. So precision targets are checked against a lower credible
+bound instead (precision_lower_bound): a target counts as met only where the bound clears it, at confidence CONFIDENCE.
+The F-beta operating point is the optimum of the point-estimate curve, with its bound reported alongside.
+
+Labels come from the current doc datasets rather than the ones the model trained with (load_test_predictions), so after
+test-split labels are audited (audit_comprehensive_negatives.py) and the datasets rebuilt, thresholds can be recomputed
+without retraining. make_classification_datasets.service_split keeps the scored test docs in the test split.
 
 Results are written as thresholds.json into each case's model version directory
-(data/models/{model_version}/{case_id}/) — the same layout inference.get_threshold() loads from in production, and
-where the final model's adapter will land once trained (train.py --train_final) and pulled from S3.
-
-With --calibrate, the aggregation rule itself is evaluated instead (leave_one_fold_out): thresholds aggregated from
-4 folds are applied to the 5th fold's scores, which came from a model the thresholds never saw — the same situation
-as the final model in production. Results land in data/training/{model_version}/threshold_calibration.parquet for
-notebooks/v4_thresholds.py, to calibrate CONSERVATIVE_K / MAX_STD_LOGIT.
+(data/models/{model_version}/{case_id}/) — the same layout inference.get_threshold() loads from in production.
 """
 
 TARGET_PRECISIONS = [0.7, 0.8, 0.9, 0.95]
 FSCORE_BETA = 1.5
-# Conservative direction for precision targets is a *higher* threshold (opposite of tfidf.py's recall targets)
-CONSERVATIVE_K = 0.5
-# Initial stability gate on the std of per-fold threshold logits; to be recalibrated after the pilot runs
-MAX_STD_LOGIT = 1.0
-# An operating point must be attainable in all but one fold to be trusted
-MAX_UNATTAINABLE_FOLDS = 1
-# Fewer fold thresholds than this can't support a stability claim (std of 1-2 values means little)
-MIN_FOLDS_FOR_STABILITY = 3
-
-EPS = 1e-6
+# One-sided confidence that a precision target's threshold really meets the target
+CONFIDENCE = 0.8
+# Posterior draws per threshold in precision_lower_bound
+N_DRAWS = 4000
+# Beta(PRIOR, PRIOR) is the Jeffreys prior for recall and each FPR stratum
+PRIOR = 0.5
 
 
-def _logit(p):
-    p = np.clip(p, EPS, 1 - EPS)
-    return np.log(p / (1 - p))
-
-
-def _sigmoid(x):
-    return 1 / (1 + np.exp(-x))
+def _count_at_or_above(scores, thresholds) -> np.ndarray:
+    """Number of `scores` at or above each threshold"""
+    return len(scores) - np.searchsorted(np.sort(scores), thresholds, side="left")
 
 
 def _frac_at_or_above(scores, thresholds):
     """Fraction of `scores` at or above each threshold (0 where there are no scores)"""
     if len(scores) == 0:
         return np.zeros(np.shape(thresholds))
-    return 1 - np.searchsorted(np.sort(scores), thresholds, side="left") / len(scores)
+    return _count_at_or_above(scores, thresholds) / len(scores)
 
 
 def production_fpr(thresholds, reviewed_neg, declined_neg, declined_weight: float):
@@ -116,164 +104,144 @@ def corrected_pr_curve(
     return thresholds, recall, precision
 
 
-def _threshold_for_precision(thresholds, recall, precision, target: float) -> float | None:
-    """The minimum threshold (i.e. maximum recall) whose corrected precision meets the target, or None.
-    Per-fold noise in these picks is handled by the cross-fold aggregation, not smoothed here."""
-    ok = (precision >= target) & (recall > 0)
+def _beta_draws(rng: np.random.Generator, k: np.ndarray, n: int, n_draws: int) -> np.ndarray:
+    """Draws from the Jeffreys posterior of a rate observed as k out of n, for each element of k.
+    :return: array of shape (n_draws, len(k))"""
+    return rng.beta(k + PRIOR, n - k + PRIOR, size=(n_draws, len(k)))
+
+
+def precision_lower_bound(
+    thresholds,
+    pos_scores,
+    reviewed_neg,
+    prevalence: float,
+    declined_neg=None,
+    declined_weight: float = 0.0,
+    confidence: float = CONFIDENCE,
+    n_draws: int = N_DRAWS,
+    seed: int = 0,
+) -> np.ndarray:
+    """
+    Lower credible bound on prevalence-corrected precision at each threshold. Recall and each negative stratum's FPR get
+    independent Jeffreys posteriors from their counts at or above the threshold. Each posterior draw goes through the
+    same formula as corrected_pr_curve, and the bound is the draws' (1 - confidence) quantile.
+
+    Unlike a bootstrap, this stays uncertain where no negatives score above a threshold: 0 of 140 reviewed negatives is
+    still consistent with an FPR around a percent, and at low prevalence that costs a lot of precision. Sparse strata
+    (e.g. a handful of declined negatives) widen the bound in proportion to their weight.
+    :param thresholds: a threshold or an array of them
+    :return: the bound at each threshold
+    """
+    thresholds = np.atleast_1d(thresholds)
+    declined_neg = np.array([]) if declined_neg is None else declined_neg
+    rng = np.random.default_rng(seed)
+    recall = _beta_draws(rng, _count_at_or_above(pos_scores, thresholds), len(pos_scores), n_draws)
+    fpr = _beta_draws(rng, _count_at_or_above(reviewed_neg, thresholds), len(reviewed_neg), n_draws)
+    if len(declined_neg) > 0 and declined_weight > 0:
+        declined_fpr = _beta_draws(rng, _count_at_or_above(declined_neg, thresholds), len(declined_neg), n_draws)
+        fpr = (1 - declined_weight) * fpr + declined_weight * declined_fpr
+    # Beta draws are strictly positive, so the denominator is too
+    precision = recall * prevalence / (recall * prevalence + fpr * (1 - prevalence))
+    return np.quantile(precision, 1 - confidence, axis=0)
+
+
+def _index_for_precision(recall, precision_lb, target: float) -> int | None:
+    """The minimum threshold (i.e. maximum recall) whose precision lower bound meets the target, or None"""
+    ok = (precision_lb >= target) & (recall > 0)
     if not ok.any():
         return None
-    return float(thresholds[np.argmax(ok)])
+    return int(np.argmax(ok))
 
 
-def _threshold_for_fbeta(thresholds, recall, precision, beta: float) -> float | None:
-    """The threshold maximizing F-beta of corrected precision and recall, or None if the curve is degenerate."""
+def _index_for_fbeta(recall, precision, beta: float) -> int | None:
+    """The threshold maximizing F-beta of corrected precision and recall, or None if the curve is degenerate"""
     precision = np.nan_to_num(precision)
     denom = np.square(beta) * precision + recall
     with np.errstate(divide="ignore", invalid="ignore"):
         fscore = np.where(denom > 0, (1 + np.square(beta)) * precision * recall / denom, 0.0)
     if fscore.max() <= 0:
         return None
-    return float(thresholds[np.argmax(fscore)])
+    return int(np.argmax(fscore))
 
 
-def _metrics_at_threshold(
-    threshold: float, fold_scores: list[dict], prevalence: float, declined_weight: float = 0.0
-) -> dict:
-    """Mean recall / corrected precision / raw (eval-set, all negatives) precision across folds at a fixed threshold.
-    With declined_weight 0 the corrected precision's FPR comes from reviewed negatives alone."""
-    recalls, corrected, raw = [], [], []
-    for fold in fold_scores:
-        pos, reviewed_neg, all_neg = fold["pos"], fold["reviewed_neg"], fold["all_neg"]
-        if len(pos) == 0:
-            continue
-        r = (pos >= threshold).mean()
-        recalls.append(r)
-        if len(reviewed_neg) > 0:
-            fpr = float(production_fpr(threshold, reviewed_neg, fold["declined_neg"], declined_weight))
-            denom = r * prevalence + fpr * (1 - prevalence)
-            if denom > 0:
-                corrected.append(r * prevalence / denom)
-        tp = (pos >= threshold).sum()
-        fp = (all_neg >= threshold).sum()
-        if tp + fp > 0:
-            raw.append(tp / (tp + fp))
-
-    def _mean(values):
-        return float(np.mean(values)) if values else None
-
+def _test_scores(test_doc_df: pd.DataFrame) -> dict[str, np.ndarray]:
+    """Splits a case's test-split doc scores into positives, reviewed- and declined-source negatives, and all
+    negatives"""
+    negatives = test_doc_df[test_doc_df.label == "negative"]
     return {
-        "achieved_recall_mean": _mean(recalls),
-        "corrected_precision": _mean(corrected),
-        "raw_precision": _mean(raw),
+        "pos": test_doc_df[test_doc_df.label == "positive"].pred_score.to_numpy(),
+        "reviewed_neg": negatives[negatives.source == "reviewed"].pred_score.to_numpy(),
+        "declined_neg": negatives[negatives.source == "declined"].pred_score.to_numpy(),
+        "all_neg": negatives.pred_score.to_numpy(),
     }
 
 
-def _aggregate_logits(logits: np.ndarray) -> tuple[float, float, float, bool]:
-    """The production aggregation rule over per-fold threshold logits.
-    :return: (threshold logit, mean logit, std logit, stable)"""
-    mean_logit = float(np.mean(logits))
-    std_logit = float(np.std(logits))
-    stable = std_logit <= MAX_STD_LOGIT and len(logits) >= MIN_FOLDS_FOR_STABILITY
-    if stable:
-        return mean_logit + CONSERVATIVE_K * std_logit, mean_logit, std_logit, stable
-    # Folds disagree too much to trust an average; fall back to the most conservative fold threshold
-    return float(logits.max()), mean_logit, std_logit, stable
-
-
-def _aggregate_operating_point(
-    name: str,
-    per_fold_thresholds: list[float | None],
-    fold_scores: list[dict],
-    prevalence: float,
-    declined_weight: float,
-    target_precision: float | None = None,
-) -> dict:
-    valid = [t for t in per_fold_thresholds if t is not None]
-    attainable = len(per_fold_thresholds) - len(valid) <= MAX_UNATTAINABLE_FOLDS and len(valid) > 0
-    op: dict[str, Any] = {"name": name, "per_fold_thresholds": per_fold_thresholds, "attainable": attainable}
+def _operating_point(
+    name: str, i: int | None, curve: tuple, scores: dict, target_precision: float | None = None
+) -> dict[str, Any]:
+    """
+    An operating point's entry in thresholds.json, at index `i` of `curve` (None: not attainable)
+    :param curve: (thresholds, recall, corrected precision, precision lower bound), aligned arrays
+    """
+    op: dict[str, Any] = {"name": name}
     if target_precision is not None:
         op["target_precision"] = target_precision
-    if len(valid) == 0:
-        op.update({"threshold": None, "mean_logit": None, "std_logit": None, "stable": False})
+    if i is None:
+        op.update({"attainable": False, "threshold": None})
         return op
 
-    threshold_logit, mean_logit, std_logit, stable = _aggregate_logits(_logit(np.array(valid)))
-    threshold = float(_sigmoid(threshold_logit))
-
-    op.update({"threshold": threshold, "mean_logit": mean_logit, "std_logit": std_logit, "stable": stable})
-    op.update(_metrics_at_threshold(threshold, fold_scores, prevalence, declined_weight))
+    thresholds, recall, precision, precision_lb = curve
+    threshold = float(thresholds[i])
+    n_pos_above = int((scores["pos"] >= threshold).sum())
+    n_neg_above = int((scores["all_neg"] >= threshold).sum())
+    op.update(
+        {
+            "attainable": True,
+            "threshold": threshold,
+            "recall": float(recall[i]),
+            "corrected_precision": float(precision[i]),
+            "precision_lower_bound": float(precision_lb[i]),
+            # Over all test negatives, uncorrected for prevalence
+            "raw_precision": n_pos_above / (n_pos_above + n_neg_above),
+            "n_pos_above": n_pos_above,
+            "n_reviewed_neg_above": int((scores["reviewed_neg"] >= threshold).sum()),
+            "n_declined_neg_above": int((scores["declined_neg"] >= threshold).sum()),
+        }
+    )
     return op
 
 
-def _fold_scores(doc_pred_df: pd.DataFrame, case_id: int) -> list[dict[str, Any]]:
-    """Splits out-of-fold doc scores by fold into positives, reviewed- and declined-source negatives, and all
-    negatives"""
-    df = doc_pred_df[doc_pred_df.pred_score.notna()]
-    if len(df) < len(doc_pred_df):
-        logger.warning(f"Case {case_id}: {len(doc_pred_df) - len(df)} docs are missing a pred_score")
-
-    fold_scores: list[dict[str, Any]] = []
-    for fold_i in sorted(df.fold.unique()):
-        fold_df = df[df.fold == fold_i]
-        negatives = fold_df[fold_df.label == "negative"]
-        fold_scores.append(
-            {
-                "fold": int(fold_i),
-                "pos": fold_df[fold_df.label == "positive"].pred_score.values,
-                "reviewed_neg": negatives[negatives.source == "reviewed"].pred_score.values,
-                "declined_neg": negatives[negatives.source == "declined"].pred_score.values,
-                "all_neg": negatives.pred_score.values,
-            }
-        )
-    return fold_scores
-
-
-def _per_fold_operating_points(
-    fold_scores: list[dict], prevalence: float, declined_weight: float, case_id: int
-) -> list[tuple[str, float | None, list[float | None]]]:
+def compute_case_thresholds(test_doc_df: pd.DataFrame, prevalence_entry: dict, case_id: int) -> dict:
     """
-    Each operating point's threshold picked independently on every fold's prevalence-corrected PR curve.
-    :return: list of (operating point name, target precision or None for F-beta, per-fold thresholds aligned with
-        `fold_scores`, None where the fold can't support one)
-    """
-    fold_curves: list[tuple[np.ndarray, np.ndarray, np.ndarray] | None] = []
-    for fold in fold_scores:
-        if len(fold["pos"]) == 0 or len(fold["reviewed_neg"]) == 0:
-            logger.warning(f"Case {case_id} fold {fold['fold']}: no positives or no reviewed negatives, skipping fold")
-            fold_curves.append(None)
-        else:
-            fold_curves.append(
-                corrected_pr_curve(fold["pos"], fold["reviewed_neg"], prevalence, fold["declined_neg"], declined_weight)
-            )
-
-    fbeta_folds = [_threshold_for_fbeta(*curve, FSCORE_BETA) if curve is not None else None for curve in fold_curves]
-    points: list[tuple[str, float | None, list[float | None]]] = [("fbeta15", None, fbeta_folds)]
-    for target in TARGET_PRECISIONS:
-        per_fold = [_threshold_for_precision(*curve, target) if curve is not None else None for curve in fold_curves]
-        points.append((f"precision{target * 100:.0f}", target, per_fold))
-    return points
-
-
-def compute_case_thresholds(doc_pred_df: pd.DataFrame, prevalence_entry: dict, case_id: int) -> dict:
-    """
-    :param doc_pred_df: the per-case doc dataset with out-of-fold `pred_score` for every fold (train.py output)
+    :param test_doc_df: the case's test-split docs with `pred_score` (load_test_predictions)
     :param prevalence_entry: this case's entry from compute_case_prevalence()
     :return: the thresholds.json artifact contents (see module docstring)
     """
     prevalence, declined_weight = prevalence_entry["prevalence"], prevalence_entry["declined_weight"]
-    fold_scores = _fold_scores(doc_pred_df, case_id)
-    operating_points = [
-        _aggregate_operating_point(name, per_fold, fold_scores, prevalence, declined_weight, target_precision=target)
-        for name, target, per_fold in _per_fold_operating_points(fold_scores, prevalence, declined_weight, case_id)
-    ]
+    scored = test_doc_df[test_doc_df.pred_score.notna()]
+    if len(scored) < len(test_doc_df):
+        logger.warning(f"Case {case_id}: {len(test_doc_df) - len(scored)} test docs have no pred_score")
+    scores = _test_scores(scored)
 
-    stable = all(op["stable"] for op in operating_points if op["attainable"])
-    for op in operating_points:
-        if op["attainable"] and not op["stable"]:
-            logger.warning(
-                f"Case {case_id} operating point {op['name']} has unstable fold thresholds "
-                f"(std_logit {op['std_logit']:.2f} > {MAX_STD_LOGIT}); using most conservative fold threshold"
-            )
+    targets = {f"precision{target * 100:.0f}": target for target in TARGET_PRECISIONS}
+    if len(scores["pos"]) == 0 or len(scores["reviewed_neg"]) == 0:
+        logger.warning(
+            f"Case {case_id}: no test positives or no reviewed negatives, so no operating point is attainable"
+        )
+        operating_points = [_operating_point("fbeta15", None, (), scores)] + [
+            _operating_point(name, None, (), scores, target_precision=target) for name, target in targets.items()
+        ]
+    else:
+        args = (scores["pos"], scores["reviewed_neg"], prevalence, scores["declined_neg"], declined_weight)
+        thresholds, recall, precision = corrected_pr_curve(*args)
+        precision_lb = precision_lower_bound(thresholds, *args)
+        curve = (thresholds, recall, precision, precision_lb)
+        operating_points = [
+            _operating_point("fbeta15", _index_for_fbeta(recall, precision, FSCORE_BETA), curve, scores)
+        ]
+        for name, target in targets.items():
+            i = _index_for_precision(recall, precision_lb, target)
+            operating_points.append(_operating_point(name, i, curve, scores, target_precision=target))
 
     return {
         "case_id": int(case_id),
@@ -282,128 +250,26 @@ def compute_case_thresholds(doc_pred_df: pd.DataFrame, prevalence_entry: dict, c
         "n_positive": prevalence_entry["n_positive"],
         "n_declined": prevalence_entry["n_declined"],
         "declined_weight": declined_weight,
-        "stable": stable,
+        "confidence": CONFIDENCE,
+        "n_test_pos": len(scores["pos"]),
+        "n_test_reviewed_neg": len(scores["reviewed_neg"]),
+        "n_test_declined_neg": len(scores["declined_neg"]),
         "dataset_version": make_classification_datasets.LATEST_VERSION,
         "operating_points": operating_points,
     }
-
-
-def mean_k_rule(k: float):
-    """mean + k * std (ddof=0, as in thresholds.json) with no stability gate"""
-
-    def rule(logits: np.ndarray) -> float | None:
-        return float(np.mean(logits) + k * np.std(logits))
-
-    return rule
-
-
-def t_interval_rule(q: float):
-    """
-    One-sided upper prediction bound at coverage q: if fold threshold logits are normal and the final model's ideal
-    threshold is one more draw from the same distribution, it lands at or below this bound with probability q. The
-    t quantile and sqrt(1 + 1/n) widen the bound when there are few folds to estimate the mean and std from.
-    """
-
-    def rule(logits: np.ndarray) -> float | None:
-        n = len(logits)
-        if n < 2:
-            return None
-        return float(np.mean(logits) + stats.t.ppf(q, n - 1) * np.std(logits, ddof=1) * np.sqrt(1 + 1 / n))
-
-    return rule
-
-
-# Candidate aggregation rules for leave_one_fold_out, from per-fold threshold logits to a threshold logit (or None
-# when the rule can't produce one). "production" is the rule thresholds.json currently uses.
-CALIBRATION_RULES = {
-    "production": lambda logits: _aggregate_logits(logits)[0],
-    "max": lambda logits: float(logits.max()),
-    **{f"mean_k{k:g}": mean_k_rule(k) for k in [0.0, 0.25, 0.5, 0.75, 1.0, 1.5]},
-    **{f"t_q{q:g}": t_interval_rule(q) for q in [0.5, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]},
-}
-
-
-def leave_one_fold_out(doc_pred_df: pd.DataFrame, prevalence_entry: dict, case_id: int, rules=None) -> pd.DataFrame:
-    """
-    Evaluates threshold aggregation rules the way production uses them: per-fold thresholds from all folds but one
-    are aggregated, and the result is applied to the held-out fold's scores. Those scores come from a model the
-    aggregated thresholds never saw, which is the situation the final full-data model is in.
-
-    One row per (operating point, held-out fold, rule), with:
-    - n_folds, mean_logit, std_logit: the per-fold thresholds the rule aggregated (std ddof=0, as in thresholds.json)
-    - held_out_ideal_logit: the held-out fold's own threshold for the operating point (nan where unattainable), and
-      covered = threshold_logit >= held_out_ideal_logit, a direct coverage test for t_interval_rule's q
-    - recall / corrected_precision / raw_precision realized on the held-out fold, and precision_shortfall
-      (target - corrected precision; positive means the target was missed). corrected_precision is nan when nothing
-      scores above the threshold
-    - n_pos / n_reviewed_neg / n_declined_neg and the counts above threshold, to judge how much each realized precision
-      can be trusted
-    """
-    rules = CALIBRATION_RULES if rules is None else rules
-    prevalence, declined_weight = prevalence_entry["prevalence"], prevalence_entry["declined_weight"]
-    fold_scores = _fold_scores(doc_pred_df, case_id)
-    rows = []
-    for name, target, per_fold in _per_fold_operating_points(fold_scores, prevalence, declined_weight, case_id):
-        for i, held_out in enumerate(fold_scores):
-            if len(held_out["pos"]) == 0 or len(held_out["reviewed_neg"]) == 0:
-                continue
-            others = [t for j, t in enumerate(per_fold) if j != i and t is not None]
-            if not others:
-                continue
-            logits = _logit(np.array(others))
-            ideal = per_fold[i]
-            ideal_logit = float(_logit(ideal)) if ideal is not None else np.nan
-            base = {
-                "case_id": int(case_id),
-                "operating_point": name,
-                "target_precision": target,
-                "held_out_fold": held_out["fold"],
-                "n_folds": len(others),
-                "mean_logit": float(np.mean(logits)),
-                "std_logit": float(np.std(logits)),
-                "held_out_ideal_logit": ideal_logit,
-                "n_pos": len(held_out["pos"]),
-                "n_reviewed_neg": len(held_out["reviewed_neg"]),
-                "n_declined_neg": len(held_out["declined_neg"]),
-            }
-            for rule_name, rule in rules.items():
-                threshold_logit = rule(logits)
-                if threshold_logit is None:
-                    continue
-                threshold = float(_sigmoid(threshold_logit))
-                metrics = _metrics_at_threshold(threshold, [held_out], prevalence, declined_weight)
-                precision = metrics["corrected_precision"]
-                rows.append(
-                    {
-                        **base,
-                        "rule": rule_name,
-                        "threshold_logit": threshold_logit,
-                        "threshold": threshold,
-                        "covered": threshold_logit >= ideal_logit if ideal is not None else np.nan,
-                        "recall": metrics["achieved_recall_mean"],
-                        "corrected_precision": precision if precision is not None else np.nan,
-                        "raw_precision": metrics["raw_precision"] if metrics["raw_precision"] is not None else np.nan,
-                        "precision_shortfall": target - precision
-                        if target is not None and precision is not None
-                        else np.nan,
-                        "n_pos_above": int((held_out["pos"] >= threshold).sum()),
-                        "n_reviewed_neg_above": int((held_out["reviewed_neg"] >= threshold).sum()),
-                        "n_declined_neg_above": int((held_out["declined_neg"] >= threshold).sum()),
-                    }
-                )
-    return pd.DataFrame(rows)
 
 
 def compute_case_prevalence(documents, points, comprehensive_threshold: int, en_only=True) -> dict[int, dict]:
     """
     Estimates per-case production prevalence: among comprehensively reviewed docs (same criteria as
     make_classification_datasets.make_doc_datasets), the fraction that have an approved point for the case. Used to
-    convert eval-set precision into an estimate of precision against the production corpus of all documents.
+    convert test-set precision into an estimate of precision against the production corpus of all documents.
     Computed on the fly from the cleaned DB dumps rather than serialized, so it can't go stale.
     Also estimates the declined stratum's share of production negatives (declined_weight for production_fpr): among
     comprehensively reviewed docs without an approved point for the case, the fraction with a declined one.
     Caveat: comprehensively reviewed docs skew toward popular services, so these are proxies, not corrected for that
-    sampling bias.
+    sampling bias. They also count train-split docs, whose labels get less auditing than the test split's, so missed
+    points there bias prevalence low.
 
     :return: dict from case id to
         {'prevalence': float, 'n_reviewed': int, 'n_positive': int, 'n_declined': int, 'declined_weight': float}
@@ -440,53 +306,62 @@ def compute_case_prevalence(documents, points, comprehensive_threshold: int, en_
     return prevalence
 
 
-def _load_cv_results(model_version: str) -> tuple[dict[int, pd.DataFrame], dict[int, dict]]:
-    """:return: out-of-fold doc predictions by case (train.py CV output) and compute_case_prevalence() entries"""
-    doc_pred_path = here / f"../../data/training/{model_version}/cv/doc_pred.pkl"
+def load_test_predictions(model_version: str) -> dict[int, pd.DataFrame]:
+    """
+    Test-split doc scores by case (train.py output), with labels and sources from the current doc datasets rather than
+    the ones the model trained with, so label fixes from auditing take effect without retraining. Current test docs
+    the model never scored (e.g. new in a later DB dump) are left out, with a warning.
+    :return: dict from case id to the case's current test docs [id_doc, id_service, label, source, pred_score]
+    """
+    doc_pred_path = here / f"../../data/training/{model_version}/doc_pred.pkl"
     logger.info(f"Loading doc predictions from {doc_pred_path}")
     with open(doc_pred_path, "rb") as f:
         doc_results: dict[int, pd.DataFrame] = pickle.load(f)
+    scores = {
+        case_id: df.loc[df.split == "test", ["id_doc", "label", "pred_score"]] for case_id, df in doc_results.items()
+    }
+    del doc_results  # the doc text makes this several GB
+
+    logger.info("Loading the current doc datasets for labels")
+    current = make_classification_datasets.load_docs()
+    test_preds = dict()
+    for case_id, case_scores in scores.items():
+        if case_id not in current:
+            logger.warning(f"Case {case_id} is no longer in the doc datasets, skipping")
+            continue
+        test_docs = current[case_id]
+        test_docs = test_docs.loc[test_docs.split == "test", ["id_doc", "id_service", "label", "source"]]
+        merged = test_docs.merge(
+            case_scores.rename(columns={"label": "trained_label"}), on="id_doc", how="left", indicator=True
+        )
+        unscored = merged._merge == "left_only"
+        if unscored.any():
+            logger.warning(f"Case {case_id}: {unscored.sum()} current test docs were never scored, leaving them out")
+        n_dropped = len(set(case_scores.id_doc) - set(test_docs.id_doc))
+        if n_dropped:
+            logger.info(f"Case {case_id}: {n_dropped} scored test docs are no longer in the dataset")
+        merged = merged[~unscored]
+        n_relabeled = (merged.label != merged.trained_label).sum()
+        if n_relabeled:
+            logger.info(f"Case {case_id}: {n_relabeled} test docs relabeled since training")
+        test_preds[case_id] = merged.drop(columns=["trained_label", "_merge"])
+    return test_preds
+
+
+def run(model_version: str, upload: bool = False):
+    test_preds = load_test_predictions(model_version)
 
     logger.info("Computing case prevalence from the cleaned DB dumps")
     _, documents, points = make_classification_datasets.load_clean_dumps()
     prevalence = compute_case_prevalence(documents, points, make_classification_datasets.COMPREHENSIVE_THRESHOLD)
-    return doc_results, prevalence
-
-
-def calibration_path(model_version: str) -> Path:
-    return here / f"../../data/training/{model_version}/threshold_calibration.parquet"
-
-
-def calibrate(model_version: str) -> pd.DataFrame:
-    """Runs leave_one_fold_out over every case of a CV run and writes the combined rows to calibration_path()"""
-    doc_results, prevalence = _load_cv_results(model_version)
-    frames = []
-    for case_id, doc_pred_df in doc_results.items():
-        if case_id not in prevalence:
-            logger.warning(f"Case {case_id} has no prevalence estimate, skipping")
-            continue
-        case_df = leave_one_fold_out(doc_pred_df, prevalence[case_id], case_id)
-        case_df["prevalence"] = prevalence[case_id]["prevalence"]
-        case_df["declined_weight"] = prevalence[case_id]["declined_weight"]
-        frames.append(case_df)
-    calibration = pd.concat(frames, ignore_index=True)
-
-    out_path = calibration_path(model_version)
-    logger.info(f"Writing {len(calibration)} rows to {out_path}")
-    calibration.to_parquet(out_path)
-    return calibration
-
-
-def run(model_version: str, upload: bool = False):
-    doc_results, prevalence = _load_cv_results(model_version)
 
     s3_client = boto3.client("s3", region_name=train_push.AWS_REGION) if upload else None
 
-    for case_id, doc_pred_df in doc_results.items():
+    for case_id, test_doc_df in test_preds.items():
         if case_id not in prevalence:
             logger.warning(f"Case {case_id} has no prevalence estimate, skipping")
             continue
-        artifact = compute_case_thresholds(doc_pred_df, prevalence[case_id], case_id)
+        artifact = compute_case_thresholds(test_doc_df, prevalence[case_id], case_id)
         artifact["model_version"] = model_version
 
         out_dir = inference.model_dir(case_id, model_version)
@@ -506,32 +381,21 @@ def run(model_version: str, upload: bool = False):
 
 if __name__ == "__main__":
     parser = ArgumentParser(
-        description="Compute per-case threshold menus (thresholds.json) from cross-validation doc predictions"
+        description="Compute per-case threshold menus (thresholds.json) from test-split predictions"
     )
     parser.add_argument(
         "--model_version",
         type=str,
         required=True,
-        help="Model version being prepared (e.g. v4): reads data/training/{model_version}/cv/doc_pred.pkl and "
+        help="Model version being prepared (e.g. v4): reads data/training/{model_version}/doc_pred.pkl and "
         "writes thresholds.json to data/models/{model_version}/{case_id}/, the layout production inference reads",
     )
     parser.add_argument(
         "--upload",
         action="store_true",
-        help="Also upload each thresholds.json to S3 at {model_version}/{case_id}/, the production path "
-        "(train.py --train_final --upload re-uploads it there alongside the final adapter anyway)",
-    )
-    parser.add_argument(
-        "--calibrate",
-        action="store_true",
-        help="Instead of writing thresholds.json, evaluate candidate aggregation rules by leave-one-fold-out and "
-        "write data/training/{model_version}/threshold_calibration.parquet (see notebooks/v4_thresholds.py)",
+        help="Also upload each thresholds.json to S3 at {model_version}/{case_id}/, next to the adapter from "
+        "train.py --upload. Once inference.MODEL_VERSION is {model_version}, this is what makes production serve "
+        "the case",
     )
     args = parser.parse_args()
-    if args.calibrate and args.upload:
-        parser.error("--upload has nothing to upload with --calibrate")
-
-    if args.calibrate:
-        calibrate(args.model_version)
-    else:
-        run(args.model_version, args.upload)
+    run(args.model_version, args.upload)

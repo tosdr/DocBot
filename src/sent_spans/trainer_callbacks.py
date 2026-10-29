@@ -86,7 +86,7 @@ class DocEvalCallback(TrainerCallback):
 
         labels = doc_df.int_labels
         # stop/ marks the split these come from (the stopping slice), so they read alongside train.py's test/doc_*
-        # metrics on the held-out fold. f1/prec/rec/accuracy use inference.attach_predictions' threshold, fit on
+        # metrics on the test split. f1/prec/rec/accuracy use inference.attach_predictions' threshold, fit on
         # this slice itself — the same oracle convention as test/doc_*, so the two are directly comparable.
         metrics = {
             "stop/doc_f1": f1_score(labels, doc_df.pred_label, zero_division=0),
@@ -98,7 +98,7 @@ class DocEvalCallback(TrainerCallback):
         }
         # Positive prediction rate per instance source (approved/declined/reviewed), to audit negative
         # sources for mislabeled true negatives. Sources absent from this slice simply don't appear; the
-        # test/doc_pos_rate_* equivalents cover the whole fold and are populated far more reliably.
+        # test/doc_pos_rate_* equivalents cover the whole test split and are populated far more reliably.
         for source, group in doc_df.groupby("source"):
             metrics[f"stop/doc_pos_rate_{source}"] = float(group.pred_label.mean())
         for key, val in metrics.items():

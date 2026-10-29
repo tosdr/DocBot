@@ -1,10 +1,10 @@
 import bisect
 import collections
+import functools
 import hashlib
 import itertools
 import logging
 import pickle
-import random
 from argparse import ArgumentParser
 from pathlib import Path
 
@@ -20,14 +20,19 @@ logger = logging.getLogger(__name__)
 here = Path(__file__).parent
 
 MIN_APPROVED = 40  # Focus on cases with enough approved points to fine-tune and evaluate
-NUM_FOLDS = 5  # Pre-determined train-test splits for downstream ML
+# Share of services whose docs form the test split, which is held out of training for evaluation and threshold selection
+TEST_FRACTION = 0.3
+# Salts the service hash behind service_split(). Changing it or TEST_FRACTION reassigns services, which throws away any
+# label auditing done on the test split, so treat both as fixed
+SPLIT_SALT = "docbot-test-split"
 # A doc needs this many approved points before we treat it as reviewed comprehensively enough to use as a negative.
 # Shared with sent_spans.thresholds.compute_case_prevalence so the prevalence denominator matches the `reviewed`
 # negatives that end up in the eval set.
 COMPREHENSIVE_THRESHOLD = 12
 
-DB_DUMP_VERSION = "2026-07-09"
-LATEST_VERSION = "v1"  # v1: CV folds grouped by service (v0 grouped by document)
+DB_DUMP_VERSION = "2026-10-20"
+# v2: one train/test split by service hash (v1: CV folds grouped by service, v0: CV folds grouped by document)
+LATEST_VERSION = "v1"
 
 # Outputs are saved here
 SENT_SPAN_LOC = here / f"../data/db_dumps/{DB_DUMP_VERSION}/sent_span_classification_{LATEST_VERSION}.pkl"
@@ -36,13 +41,13 @@ DOC_LOC = here / f"../data/db_dumps/{DB_DUMP_VERSION}/doc_classification_{LATEST
 """
 This module takes database dumps (cleaned up by src/clean_data.py) and forms two binary text classification datasets
 for each case: 1) sentence spans that look similar to points, 2) documents
-We create both at the same time to ensure that we use the same pre-split folds for cross validation. This allows us 
-to compare full document classification approaches (e.g. sequence tagging) with those that work on sentence spans.
+We create both at the same time so they share one train/test split (service_split). This allows us to compare full
+document classification approaches (e.g. sequence tagging) with those that work on sentence spans.
 
 For sentence span datasets, instances are similar to points, but with [sent_idx_start, sent_idx_end, sent_text, label,
-source, fold] fields, and with boundaries stretched to start/end on sentence boundaries (to match the input format 
+source, split] fields, and with boundaries stretched to start/end on sentence boundaries (to match the input format 
 during inference).
-    `fold` is an int from 0-4
+    `split` is `train` or `test`
     `label` is `positive` or `negative`
     `source` is one of [
         'approved', annotated by a human and approved by curator
@@ -55,7 +60,7 @@ during inference).
 Negative instances were designed to allow models to learn the exact patterns showing evidence for cases, without 
 just learning what topical words are.
 
-Instances of the document datasets look very similar to the `documents` table exported from the DB, but with ['fold', 
+Instances of the document datasets look very similar to the `documents` table exported from the DB, but with ['split',
 'text', 'label', 'source']
 `source` is one of [
         'approved', annotated by a human and approved by curator
@@ -578,20 +583,27 @@ def make_doc_datasets(
     return case_datasets
 
 
-def assign_folds(sent_span_datasets, doc_datasets):
+@functools.cache
+def service_split(service_id) -> str:
     """
-    Folds are split by service so near-duplicate documents from the same service (privacy policy vs ToS,
-    recrawls) can't leak between train and test — in either the sent-span or doc dataset, which share folds.
-    Within that constraint, services are bucketed into those contributing any positive instance vs. those
-    that don't, and each bucket is sliced across folds independently — this stratifies positives so each
-    fold gets a representative share (positives are rare for many cases, and uniform shuffling leaves
-    cross-fold variance high).
+    The split ('train' or 'test') that a service's docs belong to, for every case. It's a pure function of the service
+    id so that assignments survive DB refreshes: new services, new cases and relabeled docs (e.g. points approved while
+    auditing the test split) never move an existing service between splits, which a shuffled assignment would do.
     """
+    digest = hashlib.sha256(f"{SPLIT_SALT}:{int(service_id)}".encode()).digest()
+    return "test" if int.from_bytes(digest[:8], "big") / 2**64 < TEST_FRACTION else "train"
 
-    def _gen_fold_slice(n, fold_i):
-        return slice(round(fold_i * (n / NUM_FOLDS)), round((fold_i + 1) * (n / NUM_FOLDS)))
 
-    # Both datasets share folds, so they must cover the same cases. quoted_approved_case_counts is the single
+def assign_splits(sent_span_datasets, doc_datasets, doc_service: pd.Series):
+    """
+    Adds a `split` column to both datasets. Splitting by service keeps near-duplicate documents from the same service
+    (privacy policy vs ToS, recrawls) on one side. The test split is the same set of services for every case, so
+    auditing a test doc's labels covers all cases at once. Unlike the stratified CV folds this replaces, the share of a
+    case's positives that land in test varies by case (roughly 0.2–0.4 for TEST_FRACTION 0.3).
+    :param doc_service: service id by doc id, from the documents table. Points carry their own service_id, which
+        occasionally disagrees with their document's, so instances are assigned via their document instead.
+    """
+    # Both datasets share a split, so they must cover the same cases. quoted_approved_case_counts is the single
     # case-selection definition used by both builders, so any mismatch here is a build bug — fail loudly.
     if set(sent_span_datasets.keys()) != set(doc_datasets.keys()):
         raise ValueError(
@@ -600,40 +612,18 @@ def assign_folds(sent_span_datasets, doc_datasets):
             f"doc-only={sorted(set(doc_datasets) - set(sent_span_datasets))}"
         )
 
-    rng = random.Random(0)
     for case_id in sorted(sent_span_datasets.keys()):
         sent_df = sent_span_datasets[case_id]
         doc_df = doc_datasets[case_id]
-
-        doc_service = dict(zip(sent_df.document_id, sent_df.service_id))
-        doc_service.update(zip(doc_df.id_doc, doc_df.id_service))
-
-        positive_doc_ids = set(sent_df.loc[sent_df.label == "positive", "document_id"]).union(
-            set(doc_df.loc[doc_df.label == "positive", "id_doc"])
-        )
-        positive_services = sorted({doc_service[doc_id] for doc_id in positive_doc_ids})
-        negative_only_services = sorted(set(doc_service.values()) - set(positive_services))
-
-        rng.shuffle(positive_services)
-        rng.shuffle(negative_only_services)
-
-        for fold_i in range(NUM_FOLDS):
-            fold_services = set(positive_services[_gen_fold_slice(len(positive_services), fold_i)]) | set(
-                negative_only_services[_gen_fold_slice(len(negative_only_services), fold_i)]
+        sent_df["split"] = sent_df.document_id.map(doc_service).map(service_split)
+        doc_df["split"] = doc_df.id_doc.map(doc_service).map(service_split)
+        sent_pos = ((sent_df.split == "test") & (sent_df.label == "positive")).sum()
+        doc_pos = ((doc_df.split == "test") & (doc_df.label == "positive")).sum()
+        if sent_pos == 0 or doc_pos == 0:
+            logger.warning(
+                f"Case {case_id}: {sent_pos} test sent-span positives, {doc_pos} test doc positives — test metrics "
+                "and thresholds will be unreliable"
             )
-            fold_doc_ids = {doc_id for doc_id, service in doc_service.items() if service in fold_services}
-            sent_df.loc[sent_df.document_id.isin(fold_doc_ids), "fold"] = fold_i
-            doc_df.loc[doc_df.id_doc.isin(fold_doc_ids), "fold"] = fold_i
-        sent_df.fold = sent_df.fold.astype(int)
-        doc_df.fold = doc_df.fold.astype(int)
-        for fold_i in range(NUM_FOLDS):
-            sent_pos = ((sent_df.fold == fold_i) & (sent_df.label == "positive")).sum()
-            doc_pos = ((doc_df.fold == fold_i) & (doc_df.label == "positive")).sum()
-            if sent_pos == 0 or doc_pos == 0:
-                logger.warning(
-                    f"Case {case_id} fold {fold_i}: {sent_pos} sent-span positives, "
-                    f"{doc_pos} doc positives — downstream metrics may be unreliable"
-                )
         sent_span_datasets[case_id] = sent_df
         doc_datasets[case_id] = doc_df
 
@@ -656,7 +646,7 @@ def run():
 
     sent_span_datasets = make_sent_span_datasets(cases, documents, points, pending_not_found, COMPREHENSIVE_THRESHOLD)
     doc_datasets = make_doc_datasets(cases, documents, points, pending_not_found, COMPREHENSIVE_THRESHOLD)
-    sent_span_datasets, doc_datasets = assign_folds(sent_span_datasets, doc_datasets)
+    sent_span_datasets, doc_datasets = assign_splits(sent_span_datasets, doc_datasets, documents.service_id)
 
     logger.info(f"Saving sentence span classification datasets to {SENT_SPAN_LOC}")
     with open(SENT_SPAN_LOC, "wb") as f:
@@ -679,8 +669,8 @@ def run():
         logger.info(f"\t{sent_span_datasets[case_id].source.value_counts()}")
         logger.info("Documents:")
         logger.info(f"\t{doc_datasets[case_id].source.value_counts()}")
-        logger.info(f"Sent span folds: {sent_span_datasets[case_id].fold.value_counts()}")
-        logger.info(f"Doc folds: {doc_datasets[case_id].fold.value_counts()}")
+        logger.info(f"Sent span splits: {sent_span_datasets[case_id].split.value_counts()}")
+        logger.info(f"Doc splits: {doc_datasets[case_id].split.value_counts()}")
 
 
 if __name__ == "__main__":

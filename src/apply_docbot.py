@@ -4,7 +4,6 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from io import BytesIO
 import logging
-import operator
 import os
 from pathlib import Path
 import pickle
@@ -44,6 +43,9 @@ BOTO_CONFIG = BotoConfig(
 )
 
 DOCBOT_USER_ID = 21032
+
+# Current peft writes adapter weights as safetensors; models trained with older peft versions (v3) have a .bin
+ADAPTER_WEIGHTS_FILENAMES = ["adapter_model.safetensors", "adapter_model.bin"]
 
 # Batch size for flushing docbot records to API
 DOCBOT_RECORD_BATCH_SIZE = 50
@@ -143,15 +145,27 @@ def load_peft_model(case_id, base_model, local_models):
         s3_client = boto3.client("s3", config=BOTO_CONFIG)
 
         tmpdir = tempfile.TemporaryDirectory()
-        logger.info(f"Pulling PEFT adapter from: s3://{MODEL_S3_BUCKET}/{MODEL_VERSION}/{case_id}/adapter_model.bin")
-        for filename in ["adapter_model.bin", "adapter_config.json"]:
+        logger.info(f"Pulling PEFT adapter from: s3://{MODEL_S3_BUCKET}/{MODEL_VERSION}/{case_id}/")
+
+        def download(filename):
             with s3_fileobj(MODEL_S3_BUCKET, f"{MODEL_VERSION}/{case_id}/{filename}", s3_client) as f:
                 with open(f"{tmpdir.name}/{filename}", "wb") as to_file:
                     to_file.write(f.read())
+
+        download("adapter_config.json")
+        for weights_filename in ADAPTER_WEIGHTS_FILENAMES:
+            try:
+                download(weights_filename)
+                break
+            except s3_client.exceptions.NoSuchKey:
+                continue
+        else:
+            raise FileNotFoundError(f"No adapter weights for case {case_id} (tried {ADAPTER_WEIGHTS_FILENAMES})")
         peft_model_loc = tmpdir.name
 
         # The thresholds menu ships alongside the adapters; cache it where inference.get_threshold() looks.
-        # Model versions predating thresholds.json (v3) fall back to the legacy inference.THRESHOLDS dict.
+        # Model versions predating thresholds.json (inference.LEGACY_THRESHOLD_VERSIONS) fall back to the legacy
+        # inference.THRESHOLDS dict; for any other version, get_threshold() refuses a case without one.
         try:
             with s3_fileobj(MODEL_S3_BUCKET, f"{MODEL_VERSION}/{case_id}/thresholds.json", s3_client) as f:
                 local_dir = inference.model_dir(case_id)
@@ -159,7 +173,7 @@ def load_peft_model(case_id, base_model, local_models):
                 with open(local_dir / "thresholds.json", "wb") as to_file:
                     to_file.write(f.read())
         except s3_client.exceptions.NoSuchKey:
-            logger.info(f"No thresholds.json in S3 for case {case_id}, will use the legacy threshold")
+            logger.info(f"No thresholds.json in S3 for case {case_id}")
 
     model = PeftModel.from_pretrained(base_model, peft_model_loc)
     # https://github.com/huggingface/peft/issues/217#issuecomment-1506224612
@@ -429,13 +443,28 @@ def get_all_docs(local_data, phoenix_client) -> list[tuple[int, str]]:
 
 
 def list_case_models_s3(s3_client) -> list[int]:
-    case_ids = set()
-    list_result = s3_client.list_objects(Bucket=MODEL_S3_BUCKET, Prefix=f"{MODEL_VERSION}/")
-    for object_key in map(operator.itemgetter("Key"), list_result["Contents"]):
-        match = re.match(rf"^{MODEL_VERSION}/(\d+)/adapter_model.bin", object_key)
-        if match is not None:
-            case_ids.add(int(match.groups()[0]))
-    return list(sorted(case_ids))
+    """
+    Cases with a model under MODEL_VERSION in S3. Past the legacy versions, a case also needs its thresholds.json:
+    train.py uploads adapters before thresholds.py has picked their thresholds, and those cases mustn't be served yet.
+    """
+    filenames_by_case = defaultdict(set)
+    paginator = s3_client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=MODEL_S3_BUCKET, Prefix=f"{MODEL_VERSION}/"):
+        for obj in page.get("Contents", []):
+            match = re.match(rf"^{MODEL_VERSION}/(\d+)/([^/]+)$", obj["Key"])
+            if match is not None:
+                filenames_by_case[int(match.group(1))].add(match.group(2))
+
+    needs_thresholds = MODEL_VERSION not in inference.LEGACY_THRESHOLD_VERSIONS
+    case_ids = []
+    for case_id, filenames in sorted(filenames_by_case.items()):
+        if not filenames & set(ADAPTER_WEIGHTS_FILENAMES):
+            continue
+        if needs_thresholds and "thresholds.json" not in filenames:
+            logger.warning(f"Skipping case {case_id}: its model has no thresholds.json in S3 yet")
+            continue
+        case_ids.append(case_id)
+    return case_ids
 
 
 def save_results(case_result_scores, case_result_counts, results_dir, s3_client, timestamp):

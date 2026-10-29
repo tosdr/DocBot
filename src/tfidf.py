@@ -13,7 +13,7 @@ import spacy
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression, SGDClassifier
 from sklearn.metrics import average_precision_score, confusion_matrix, precision_recall_curve
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedGroupKFold
 from textacy import extract
 from textacy.representations.vectorizers import Vectorizer
 from tqdm import tqdm
@@ -24,24 +24,31 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 here = Path(__file__).parent
 
-DB_DUMP_VERSION = "2026-07-09"
+DB_DUMP_VERSION = make_classification_datasets.DB_DUMP_VERSION
 RANDOM_STATE = 0
 random.seed(RANDOM_STATE)
 
-# When updating, be sure to modify .dockerignore so the models are copied into the inference Docker image
-MODEL_VERSION = "tfidf_v2"
+# The version this script trains, and that train.py evaluates new case models with. Production loads
+# inference.PREFILTER_VERSION instead, until the case models trained alongside this one ship. When that happens, be sure
+# to modify .dockerignore so the models are copied into the inference Docker image
+# tfidf_v3: trained on the train split only (make_classification_datasets.service_split)
+MODEL_VERSION = "tfidf_v3"
 
 """
 This script trains high recall TF-IDF classification models that can be used as prefilters, to avoid unnecessary 
 inference with our deep learning models for completely irrelevant sentences. For most cases it reduces inference 
-by 90-95% without dropping any positive examples in the test set.
+by 90-95% without dropping any positive examples in the cross-validation held-out folds.
+
+Only train-split docs are used (make_classification_datasets.service_split): the case models' thresholds are picked on
+test-split doc scores, which the prefilter shapes, so it mustn't have seen them either. Within the train split, each
+case's model setup and threshold are picked by cross-validation (train_cv), then a final model is fit on all of it.
 
 Models are written to data/models/{MODEL_VERSION} and later added to the inference Docker image
 """
 
 
-def model_output_dir(case_id) -> Path:
-    return here / f"../data/models/{MODEL_VERSION}/{case_id}"
+def model_output_dir(case_id, version: str = MODEL_VERSION) -> Path:
+    return here / f"../data/models/{version}/{case_id}"
 
 
 def _find_pareto_frontier(precision, recall, thresholds, critical_recalls):
@@ -154,8 +161,8 @@ def summarize_all_metrics(cv_results: list[dict], critical_recalls: list[float],
             - rebalance_to: int or None
             - avg_precision: float (mean across folds)
             - recall100_filterrate: float (mean across folds)
-            - recall100_threshold_cv: float (coefficient of variation)
-            - recall98_filterrate, recall98_threshold_cv, etc.
+            - recall100_threshold_rel_std: float (std / mean of the fold thresholds)
+            - recall98_filterrate, recall98_threshold_rel_std, etc.
     """
     res_df = []
     for idx, model in enumerate(cv_results):
@@ -182,8 +189,8 @@ def summarize_all_metrics(cv_results: list[dict], critical_recalls: list[float],
             thresholds = metrics_summary[f"{recall_str}_thresholds"]
             model_dict[f"{recall_str}_thresholds"] = thresholds
 
-            # Coefficient of variation for thresholds (std / mean)
-            model_dict[f"{recall_str}_threshold_cv"] = np.std(thresholds) / np.mean(thresholds)
+            # Relative std dev of fold thresholds (std / mean, a.k.a. coefficient of variation)
+            model_dict[f"{recall_str}_threshold_rel_std"] = np.std(thresholds) / np.mean(thresholds)
 
         res_df.append(model_dict)
 
@@ -248,7 +255,8 @@ def gen_setups() -> Iterator[Setup]:
 
 def train_cv(
     ngrams: list[list[str]],
-    sentence_labels: list[int],
+    sentence_labels: np.ndarray,
+    service_ids: np.ndarray,
     model_outdir: Path,
     critical_recalls,
     cv_folds=5,
@@ -257,6 +265,10 @@ def train_cv(
     """
     Returns a list of results describing different TF-IDF models/setups that we could use for a single case filter.
     It also serializes the list as we iterate, in case of crash
+
+    Folds are grouped by service, like make_classification_datasets.service_split, so sentences from one service's docs
+    (near-duplicate docs, or several sentences sampled from one doc) can't land on both sides of a fold and inflate
+    held-out scores. Each fold also fits its own vectorizer, so held-out sentences don't shape the vocabulary or IDF.
 
     A single result is a dictionary, with setup parameters used and a `metrics` dict, format:
     metrics = {
@@ -285,11 +297,17 @@ def train_cv(
     """
     results_filepath = model_outdir / "cv_results.pkl"
 
-    vectorizer = make_vectorizer()
-    logger.info("Vectorizing")
-    sentence_vectors = vectorizer.fit_transform(ngrams)
-    logger.info(f"Vectorized shape {sentence_vectors.shape}")
-    skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=RANDOM_STATE)
+    # Vectorize each fold once, since every setup shares the folds
+    logger.info("Vectorizing folds")
+    sgkf = StratifiedGroupKFold(n_splits=cv_folds, shuffle=True, random_state=RANDOM_STATE)
+    folds = []
+    for fold_idx, (train_idx, val_idx) in enumerate(sgkf.split(np.zeros(len(ngrams)), sentence_labels, service_ids)):
+        vectorizer = make_vectorizer()
+        X_train = vectorizer.fit_transform([ngrams[i] for i in train_idx])
+        X_val = vectorizer.transform([ngrams[i] for i in val_idx])
+        y_train, y_val = sentence_labels[train_idx], sentence_labels[val_idx]
+        folds.append((X_train, X_val, y_train, y_val))
+        logger.info(f"Fold {fold_idx}: train {X_train.shape}, val {X_val.shape}, {y_val.sum()} val positives")
 
     results: list[dict] = []
     setups = list(gen_setups())
@@ -297,10 +315,7 @@ def train_cv(
         metrics = {"avg_precisions": [], "threshold_metrics": []}
 
         logger.info(f"Training {setup_dict['model_class'].__name__} {setup_dict['model_kwargs']}")
-        for fold_idx, (train_idx, val_idx) in enumerate(skf.split(sentence_vectors, sentence_labels)):
-            X_train, X_val = sentence_vectors[train_idx], sentence_vectors[val_idx]
-            y_train, y_val = sentence_labels[train_idx], sentence_labels[val_idx]
-
+        for fold_idx, (X_train, X_val, y_train, y_val) in enumerate(folds):
             rebalance_to = setup_dict["rebalance_to"]
             if rebalance_to is not None:
                 pos_idx = np.where(y_train == 1)[0]
@@ -357,8 +372,8 @@ def train_cv(
 
             # For an overall score of each fold model we can use average precision, which apparently is a better fit than
             # ROCAUC for very imbalanced datasets like mine.
-            # We'll also use the filter rate achieved at different recalls (to be computed after-the-fact), and the std
-            # dev of CV fold thresholds
+            # We'll also use the filter rate achieved at different recalls (to be computed after-the-fact), and the
+            # relative std dev of CV fold thresholds
             metrics["avg_precisions"].append(average_precision_score(y_val, y_proba))
 
         results.append({**setup_dict, "metrics": metrics})
@@ -391,7 +406,7 @@ def train_full(
     res_df = summarize_all_metrics(cv_results, critical_recalls, cv_folds)
 
     # Calculate score for models factoring filter rate and threshold stability, select best model
-    res_df["score"] = res_df["recall100_filterrate"] + (1 - res_df["recall100_threshold_cv"])
+    res_df["score"] = res_df["recall100_filterrate"] + (1 - res_df["recall100_threshold_rel_std"])
     res_df = res_df.sort_values("score", ascending=False)
     best_model = res_df.iloc[0]
 
@@ -402,13 +417,13 @@ def train_full(
         "rebalance_to",
         "score",
         "recall100_filterrate",
-        "recall100_threshold_cv",
+        "recall100_threshold_rel_std",
         "avg_precision",
     ]
     for i, (idx, row) in enumerate(res_df.head(3).round(4).iterrows()):
         logger.info(f"    {i + 1}. {row[display_cols].to_dict()}")
 
-    if res_df.iloc[0].recall100_threshold_cv >= 0.2:
+    if res_df.iloc[0].recall100_threshold_rel_std >= 0.2:
         raise ValueError("Model does not have stable enough CV fold thresholds to trust")
     logger.info("Selecting best model and training on full dataset")
 
@@ -461,7 +476,7 @@ def train_full(
     final_metrics = {
         "threshold": recommended_threshold,
         "recall100_filterrate": best_model["recall100_filterrate"],
-        "recall100_threshold_cv": best_model["recall100_threshold_cv"],
+        "recall100_threshold_rel_std": best_model["recall100_threshold_rel_std"],
         "score": best_model["score"],
         "avg_precision": best_model["avg_precision"],
     }
@@ -497,6 +512,11 @@ def prep_datasets(
         2) a huge dataframe of sentences that can be used as negative instances, with a `offlimits_cases` field
             so I can filter out sentences when they were positive points
     """
+    # Train split only. Points are assigned via their document's service, as in make_classification_datasets
+    doc_split = documents.service_id.map(make_classification_datasets.service_split)
+    documents = documents[doc_split == "train"]
+    points = points[points.document_id.map(doc_split) == "train"]
+
     documents = documents[documents.lang == "en"]
     points = points[points.lang == "en"].copy()
     points = points[points.quote_start.notna()]
@@ -525,6 +545,8 @@ def prep_datasets(
         approved["point_id"] = approved["id"]
         positives[case_id] = approved[["point_id", "case_id", "quote_start", "quote_end", "document_id", "text"]]
 
+    # The train split alone can have fewer eligible docs than num_negative_docs
+    num_negative_docs = min(num_negative_docs, len(documents))
     negatives = []
     for i, (doc_id, doc) in tqdm(
         enumerate(documents.sample(num_negative_docs, random_state=RANDOM_STATE).iterrows()), total=num_negative_docs
@@ -584,7 +606,7 @@ def extract_ngrams(case_dataset):
     s = "\n".join(map(str, [ngrams[i] for i in np.where(sentence_labels)[0][:5]]))
     logger.info(f"ngrams preview (pos only): {s}")
 
-    return ngrams, sentence_labels
+    return ngrams, sentence_labels, case_dataset.service_id.values
 
 
 def run(skip_existing=False):
@@ -600,7 +622,7 @@ def run(skip_existing=False):
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     # Try to load cached prep_datasets result
-    prep_cache = cache_dir / f"{DB_DUMP_VERSION}_datasets_cache.pkl"
+    prep_cache = cache_dir / f"{DB_DUMP_VERSION}_{MODEL_VERSION}_datasets_cache.pkl"
     try:
         positives, negatives = pickle.load(open(prep_cache, "rb"))
         logger.info("Loaded prep_datasets from cache")
@@ -625,12 +647,14 @@ def run(skip_existing=False):
 
         # Create dataset for this case
         case_dataset: pd.DataFrame = make_case_dataset(case_id, positives, negatives)
-        ngrams, sentence_labels = extract_ngrams(case_dataset)
+        # For grouping CV folds (see train_cv)
+        case_dataset["service_id"] = case_dataset.document_id.map(documents.service_id)
+        ngrams, sentence_labels, service_ids = extract_ngrams(case_dataset)
 
         # Train and save results
         model_outdir.mkdir(parents=True, exist_ok=True)
         cv_folds = 5
-        cv_results = train_cv(ngrams, sentence_labels, model_outdir, critical_recalls, cv_folds)
+        cv_results = train_cv(ngrams, sentence_labels, service_ids, model_outdir, critical_recalls, cv_folds)
         logger.info(f"Completed CV for case {case_id}")
 
         # Train final model on full dataset

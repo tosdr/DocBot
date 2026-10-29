@@ -11,7 +11,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 here = Path(__file__).parent
 
-DB_DUMP_VERSION = "2026-07-09"
+DB_DUMP_VERSION = "2026-10-20"
 DUMP_DIR = here / f"../data/db_dumps/{DB_DUMP_VERSION}"
 
 # Hardcoded `none`/spam rows that surfaced during EDA (see notebooks/explore.py). The `(NONE)` Service (502) collects

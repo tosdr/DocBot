@@ -9,6 +9,14 @@ def _(mo):
     mo.md(r"""
     # v4 model development
 
+    /// attention | Historical: cross-validation era
+    These analyses are of the v4 **cross-validation** runs (5 folds per case). Training has since moved to one
+    train/test split, with 30% of services held out for testing (`make_classification_datasets.service_split`), so no
+    more fold runs will be added here. The conclusions on metrics (Q1), attempts (Q2, Q4), stopping-slice selection
+    (Q5) and base model (Q6) still apply. Q3's significance testing pairs case-folds, which single-split runs don't
+    have. The notebook only reads wandb runs with `job_type == "cv"`, so it still runs.
+    ///
+
     Analyses supporting the next deployed docbot models (v4). Everything here reads the CV runs that
     `src/sent_spans/train.py` logs to wandb (`radkoff/tosdr_cases`): one run per case × fold × attempt, with `test/`
     metrics measured on the held-out fold using the checkpoint chosen on the ~10% stopping slice.

@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.23.13"
+__generated_with = "0.25.0"
 app = marimo.App()
 
 
@@ -45,7 +45,7 @@ def _():
 
 @app.cell
 def _(Path):
-    VERSION = "2026-07-09"
+    VERSION = "2026-10-20"
     try:
         _here = Path(__file__).parent
     except NameError:  # e.g. running cells interactively without a file
@@ -183,7 +183,14 @@ def _(mo):
 
 
 @app.cell
-def _(DOCUMENTS_CLEAN_COLS, EXAMPLE_DOCUMENT_ID, detect_lang, np, raw_documents, raw_services):
+def _(
+    DOCUMENTS_CLEAN_COLS,
+    EXAMPLE_DOCUMENT_ID,
+    detect_lang,
+    np,
+    raw_documents,
+    raw_services,
+):
     _deleted_service_ids = raw_services[raw_services.status == "deleted"].id
 
     documents = raw_documents[
@@ -217,7 +224,16 @@ def _(mo):
 
 
 @app.cell
-def _(KEEP_POINT_STATUSES, NONE_CASE_ID, NONE_SERVICE_ID, POINTS_CLEAN_COLS, documents, np, pd, raw_points):
+def _(
+    KEEP_POINT_STATUSES,
+    NONE_CASE_ID,
+    NONE_SERVICE_ID,
+    POINTS_CLEAN_COLS,
+    documents,
+    np,
+    pd,
+    raw_points,
+):
     _served_service_ids = set(documents.service_id)  # Services that still have at least one Document
 
     points = raw_points[
@@ -485,31 +501,6 @@ def _(mo):
 @app.cell
 def _(cases, mo, topics):
     mo.vstack([mo.md("**Cases**"), cases.head(), mo.md("**Topics**"), topics.head()])
-    return
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ## Re-serialize the cleaned tables
-
-    Write the `*_clean.pkl` files. (`src/clean_data.py` does the same thing headlessly for pipelines.)
-    """)
-    return
-
-
-@app.cell
-def _(DUMP_DIR, cases, documents, mo, points, services, topics):
-    services.to_pickle(DUMP_DIR / "services_clean.pkl")
-    documents.to_pickle(DUMP_DIR / "documents_clean.pkl")
-    points.to_pickle(DUMP_DIR / "points_clean.pkl")
-    cases.to_pickle(DUMP_DIR / "cases_clean.pkl")
-    topics.to_pickle(DUMP_DIR / "topics_clean.pkl")
-    mo.md(
-        f"Wrote clean pickles to `{DUMP_DIR}`: "
-        f"{len(services)} services, {len(documents)} documents, {len(points)} points, "
-        f"{len(cases)} cases, {len(topics)} topics"
-    )
     return
 
 

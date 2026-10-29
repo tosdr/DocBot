@@ -39,7 +39,7 @@ from transformers import (
 )
 
 import wandb
-from src import aws_auth, inference, make_classification_datasets, utils
+from src import aws_auth, inference, make_classification_datasets, tfidf, utils
 from src.sent_spans import RESULTS_S3_BUCKET, TEST_CASE_IDS, train_push, trainer_callbacks
 
 logging.basicConfig(level=logging.INFO)
@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 here = Path(__file__).parent
 
 CLASSIFICATION_VERSION = make_classification_datasets.LATEST_VERSION
-# Fraction of docs held out of each training pool purely for early stopping / model selection
+# Fraction of the train split's docs held out purely for early stopping / model selection
 STOPPING_FRACTION = 0.1
 # Extra seeds tried when an attempt's model collapses to predicting no positives (see _is_collapsed)
 MAX_COLLAPSE_RETRIES = 2
@@ -73,8 +73,8 @@ DOC_PRED_COLS = ["pred_score", "pred_char_start", "pred_char_end", "pred_num_sen
 
 @dataclass
 class TrainConfig:
-    """Everything finetune()/finetune_final() need to know about how to train, so run-shape concerns
-    (cases, folds, uploads) stay in argparse and don't thread through every function."""
+    """Everything finetune() needs to know about how to train, so run-shape concerns (cases, uploads) stay in
+    argparse and don't thread through every function."""
 
     model_base: str
     batch_size: int
@@ -82,7 +82,7 @@ class TrainConfig:
     eval_steps: int
     early_stopping_patience: int
     num_train_epochs: int
-    attempts_per_fold: int
+    attempts: int
     eval_training_set: bool = False
     device: str = "cuda"
     log_wandb: bool = True
@@ -104,7 +104,7 @@ def tmp_attempt_best_loc(case_id) -> Path:
 
 
 def tmp_best_loc(case_id) -> Path:
-    # Best model across attempts (the winner among tmp_attempt_best dirs); source for test-fold predictions
+    # Best model across attempts (the winner among tmp_attempt_best dirs); source for train-split doc predictions
     # and S3 uploads
     return case_models_dir(case_id) / "tmp_best"
 
@@ -133,8 +133,8 @@ def get_sent_boundaries(doc_datasets: dict[int, pd.DataFrame]) -> dict[int, list
     return make_classification_datasets.get_sent_boundaries(unique_docs)
 
 
-def _prep_inputs(sent_spans_df, tokenizer) -> tuple[pd.DataFrame, Dataset]:
-    """Turns the sent span dataframe into int labels and a tokenized HF Dataset. Index alignment with
+def _prep_inputs(sent_spans_df, tokenizer) -> Dataset:
+    """Turns the sent span dataframe into a tokenized HF Dataset with int labels. Index alignment with
     `sent_spans_df` is preserved (row i of the Dataset is sent_spans_df row i)."""
 
     def tokenize(examples):
@@ -142,23 +142,21 @@ def _prep_inputs(sent_spans_df, tokenizer) -> tuple[pd.DataFrame, Dataset]:
         return tokenizer(examples["text"], truncation=True)
 
     # Keep only what training needs, so new dataset columns can't silently leak into the model inputs
-    input_cases = sent_spans_df[["text", "fold"]].copy()
+    input_cases = sent_spans_df[["text"]].copy()
     input_cases["label"] = (sent_spans_df.label == "positive").astype(int)
 
     dataset = Dataset.from_pandas(input_cases)
     # cast: Dataset.map is stubbed to return DatasetDict, but for a Dataset input it returns a Dataset
-    tokenized = cast(Dataset, dataset.map(tokenize, batched=True))
-    return input_cases, tokenized
+    return cast(Dataset, dataset.map(tokenize, batched=True))
 
 
 def _stopping_slice_doc_ids(sent_spans_df, doc_df, frac=STOPPING_FRACTION, seed=0) -> set:
     """
-    Picks a small set of doc ids to hold out of a training pool, used only for early stopping / best-checkpoint /
-    best-attempt selection (the training recipe needs eval data; it plays no role in thresholds or test-fold
-    predictions). Grouped by service, like make_classification_datasets.assign_folds, so near-duplicate docs can't
-    leak between the slice and the training data — and stratified the same way: services contributing any positive
-    instance are sliced separately from negative-only services, so the slice gets a representative share of rare
-    positives.
+    Picks a small set of doc ids to hold out of the train split, used only for early stopping / best-checkpoint /
+    best-attempt selection (the training recipe needs eval data; it plays no role in thresholds or test-split
+    predictions). Grouped by service, like make_classification_datasets.service_split, so near-duplicate docs can't
+    leak between the slice and the training data. Stratified as well: services contributing any positive instance are
+    sliced separately from negative-only services, so the slice gets a representative share of rare positives.
     """
     doc_service = dict(zip(sent_spans_df.document_id, sent_spans_df.service_id))
     doc_service.update(zip(doc_df.id_doc, doc_df.id_service))
@@ -196,8 +194,9 @@ def _predict_logits(model, dataset, tokenizer, cfg, case_id) -> np.ndarray:
 
 def _make_doc_eval_kwargs(case_id, tokenizer, doc_sent_boundaries, device):
     return dict(
-        prefilter_kwargs=inference.load_prefilter_kwargs(case_id),
-        # Prefilter masks depend only on the TF-IDF model and doc text, so share them across folds/attempts/evals
+        # The prefilter these models ship with: the latest one tfidf.py trains, which never saw the test split
+        prefilter_kwargs=inference.load_prefilter_kwargs(case_id, tfidf.MODEL_VERSION),
+        # Prefilter masks depend only on the TF-IDF model and doc text, so share them across attempts and evals
         prefilter_cache=dict(),
         tokenizer=tokenizer,
         sent_boundaries=doc_sent_boundaries,
@@ -206,21 +205,21 @@ def _make_doc_eval_kwargs(case_id, tokenizer, doc_sent_boundaries, device):
 
 
 @dataclass
-class TestFoldPreds:
-    """A fold's held-out predictions from one attempt's checkpoint, plus the metrics derived from them."""
+class TestPreds:
+    """The test split's predictions from one attempt's checkpoint, plus the metrics derived from them."""
 
-    sent_scores: np.ndarray  # positive-class probability, positionally aligned with the attempt's test_idxs
+    sent_scores: np.ndarray  # positive-class probability, positionally aligned with test_idxs
     doc_pred: pd.DataFrame  # test_doc_df with the DOC_PRED_COLS (and pred_label) attached
     metrics: dict
 
 
-def _test_fold_metrics(doc_pred: pd.DataFrame, sent_scores, sent_labels, sent_sources) -> dict:
+def _test_metrics(doc_pred: pd.DataFrame, sent_scores, sent_labels, sent_sources) -> dict:
     """
-    Metrics over a fold's held-out test data, named to mirror the stopping-slice metrics in
-    trainer_callbacks.DocEvalCallback (stop/doc_f1 vs test/doc_f1, etc.) so the two can be read side by side.
+    Metrics over the test split, named to mirror the stopping-slice metrics in trainer_callbacks.DocEvalCallback
+    (stop/doc_f1 vs test/doc_f1, etc.) so the two can be read side by side.
 
     doc f1/prec/rec/accuracy inherit inference.attach_predictions' threshold, which is fit on the set being scored
-    — fine for comparing folds and attempts, which is what these are for, but optimistic as absolute numbers. The
+    — fine for comparing attempts and runs, which is what these are for, but optimistic as absolute numbers. The
     stop/doc_* equivalents share that caveat. The roc_auc and ap metrics are threshold-free; ap is the headline
     metric since positives are rare and it tracks the precision/recall tradeoff the thresholds menu ships.
     """
@@ -241,9 +240,9 @@ def _test_fold_metrics(doc_pred: pd.DataFrame, sent_scores, sent_labels, sent_so
         "test/sent_roc_auc": roc_auc_score(sent_labels, sent_scores) if sent_both_classes else np.nan,
         "test/sent_ap": average_precision_score(sent_labels, sent_scores) if sent_both_classes else np.nan,
     }
-    # Positive rate per source, as in DocEvalCallback, but over the whole fold instead of the ~10% stopping slice.
-    # Rare sources (`declined` is single digits per fold) are reliably present here and frequently absent from the
-    # stop/doc_pos_rate_* equivalents.
+    # Positive rate per source, as in DocEvalCallback, but over the whole test split instead of the small stopping
+    # slice. Rare sources (`declined` has a handful of docs per case) are more reliably present here, and frequently
+    # absent from the stop/doc_pos_rate_* equivalents.
     for source, group in doc_pred.groupby("source"):
         metrics[f"test/doc_pos_rate_{source}"] = float(group.pred_label.mean())
     for source in np.unique(sent_sources):
@@ -251,24 +250,24 @@ def _test_fold_metrics(doc_pred: pd.DataFrame, sent_scores, sent_labels, sent_so
     return metrics
 
 
-def _predict_test_fold(
+def _predict_test(
     sent_spans_df, tokenized, tokenizer, case_id, cfg: TrainConfig, doc_eval_kwargs, test_idxs, test_doc_df, adapter_dir
-) -> TestFoldPreds:
+) -> TestPreds:
     """
-    Runs the model in `adapter_dir` over a fold's held-out test data. Called once per attempt, after that attempt
-    has trained and its checkpoint is already chosen, so the test fold still plays no part in early stopping,
-    checkpoint selection or attempt selection — it is measured here, never optimized against.
+    Runs the model in `adapter_dir` over the test split. Called once per attempt, after that attempt has trained and
+    its checkpoint is already chosen, so the test split still plays no part in early stopping, checkpoint selection or
+    attempt selection — it is measured here, never optimized against.
     """
     model = _load_best_model(cfg.model_base, adapter_dir, cfg.device)
     sent_scores = softmax(_predict_logits(model, tokenized.select(test_idxs), tokenizer, cfg, case_id), axis=1)[:, 1]
 
-    logger.info(f"Predicting {len(test_doc_df)} held-out test docs")
+    logger.info(f"Predicting {len(test_doc_df)} test docs")
     doc_pred = inference.attach_predictions(test_doc_df, **doc_eval_kwargs, model=model, batch_size=cfg.batch_size // 2)
     scored = doc_pred[doc_pred.pred_score.notna()]
     if len(scored) < len(doc_pred):
         logger.warning(f"{len(doc_pred) - len(scored)} test docs have no pred_score; excluded from test/ metrics")
 
-    metrics = _test_fold_metrics(
+    metrics = _test_metrics(
         scored,
         sent_scores,
         np.asarray(tokenized.select(test_idxs)["label"]),
@@ -276,21 +275,23 @@ def _predict_test_fold(
     )
     for key, val in metrics.items():
         logger.info(f"\t{key}: {val:.4f}")
-    return TestFoldPreds(sent_scores=sent_scores, doc_pred=doc_pred, metrics=metrics)
+    return TestPreds(sent_scores=sent_scores, doc_pred=doc_pred, metrics=metrics)
 
 
-def finetune(sent_spans_df, doc_df, case_id, cfg: TrainConfig, doc_sent_boundaries, cv_folds=None):
+def finetune(sent_spans_df, doc_df, case_id, cfg: TrainConfig, doc_sent_boundaries):
     """
-    Cross-validation training. For each fold, models are trained on the other folds minus a small stopping slice
-    (used for early stopping and checkpoint/attempt selection). Each attempt then predicts the held-out test fold,
-    and the attempt that won on the stopping slice supplies the returned predictions; the others' predictions are
-    only summarized into wandb test/ metrics, so per-fold and per-attempt variance is visible. The test fold plays
-    no part in any selection decision, so its predictions are honestly out-of-fold — threshold selection in
-    thresholds.py depends on this.
+    Trains a case's model on the train split, minus a small stopping slice used for early stopping and
+    checkpoint/attempt selection, and measures every attempt on the test split. The test split plays no part in any
+    selection decision, so its predictions are an honest basis for threshold selection in thresholds.py. The winning
+    attempt's model lands in tmp_best_loc(case_id) and is the one that ships, so thresholds are chosen on the exact
+    weights production runs.
 
     Returns a tuple:
-    - a copy of `sent_spans_df`, with `pred` set to a softmax probability of positive classification
-    - a copy of `doc_df` also with out-of-fold predictions of the document dataset
+    - a copy of `sent_spans_df`, with `pred` set to a softmax probability of positive classification for test-split
+      instances (NaN for the rest)
+    - a copy of `doc_df` with DOC_PRED_COLS for every doc, plus a `stopping_slice` flag. Train-split docs are scored
+      too, so their labels can be audited (audit_comprehensive_negatives.py --include_training_data), but those scores
+      are in-sample: metrics and thresholds use the test split alone.
     """
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_base)
 
@@ -298,86 +299,23 @@ def finetune(sent_spans_df, doc_df, case_id, cfg: TrainConfig, doc_sent_boundari
     doc_df = doc_df.copy()
     doc_df["int_labels"] = [0 if i == "negative" else 1 for i in doc_df.label]
 
-    input_cases, tokenized = _prep_inputs(sent_spans_df, tokenizer)
+    tokenized = _prep_inputs(sent_spans_df, tokenizer)
+    # Positional indexing into `tokenized` depends on a reset index
+    assert sent_spans_df.index.values.tolist() == list(range(len(sent_spans_df)))
 
-    if cv_folds is None:
-        cv_folds = input_cases.fold.nunique()
-    # CV logic depends on a reset index
-    assert input_cases.index.values.tolist() == list(range(len(input_cases)))
-
-    doc_eval_kwargs = _make_doc_eval_kwargs(case_id, tokenizer, doc_sent_boundaries, cfg.device)
-
-    sent_spans_df["pred"] = pd.Series(dtype=float)
-    for col in DOC_PRED_COLS:
-        doc_df[col] = pd.Series(dtype=float)
-
-    for fold_i in range(cv_folds):
-        pool_mask = input_cases.fold != fold_i
-        doc_pool_mask = doc_df.fold != fold_i
-        # Hold a slice of the training pool out for early stopping / model selection, seeded per fold so the
-        # slices differ across folds
-        stopping_doc_ids = _stopping_slice_doc_ids(sent_spans_df[pool_mask], doc_df[doc_pool_mask], seed=fold_i)
-        in_stopping = sent_spans_df.document_id.isin(stopping_doc_ids)
-        train_idxs = input_cases[pool_mask & ~in_stopping].index.values
-        stop_idxs = input_cases[pool_mask & in_stopping].index.values
-        stop_doc_df = doc_df[doc_pool_mask & doc_df.id_doc.isin(stopping_doc_ids)]
-        test_idxs = input_cases[input_cases.fold == fold_i].index.values
-        test_doc_df = doc_df[doc_df.fold == fold_i]
-
-        _, _, test_preds = _run_attempts(
-            sent_spans_df,
-            tokenized,
-            tokenizer,
-            case_id,
-            cfg,
-            doc_eval_kwargs,
-            train_idxs,
-            stop_idxs,
-            stop_doc_df,
-            fold_label=f"fold{fold_i}",
-            test_idxs=test_idxs,
-            test_doc_df=test_doc_df,
-        )
-
-        # Out-of-fold predictions, from the attempt that won on the stopping slice. Every attempt already predicted
-        # this fold for its test/ metrics, and the winner's checkpoint is exactly what gets promoted to
-        # tmp_best_loc, so re-running the model here would only reproduce what _run_attempts already returned.
-        assert test_preds is not None
-        sent_spans_df.loc[test_idxs, "pred"] = test_preds.sent_scores
-        fold_preds = test_preds.doc_pred.set_index("id_doc")
-        fold_mask = doc_df.fold == fold_i
-        doc_df.loc[fold_mask, DOC_PRED_COLS] = fold_preds.loc[doc_df.loc[fold_mask, "id_doc"], DOC_PRED_COLS].values
-
-    return sent_spans_df, doc_df
-
-
-def finetune_final(sent_spans_df, doc_df, case_id, cfg: TrainConfig, doc_sent_boundaries):
-    """
-    Trains the production model on (nearly) all data — everything except a small stratified stopping slice —
-    using the decision thresholds derived beforehand from the CV fold models (see thresholds.py).
-    The best model across attempts lands in tmp_best_loc(case_id), same as finetune().
-
-    Returns the stopping slice of `doc_df` with predictions from the final model attached, so the final model's
-    score distribution can be sanity-checked against the CV fold models' out-of-fold scores (pr_curves.ipynb).
-    """
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_base)
-
-    sent_spans_df = sent_spans_df.copy()
-    doc_df = doc_df.copy()
-    doc_df["int_labels"] = [0 if i == "negative" else 1 for i in doc_df.label]
-
-    input_cases, tokenized = _prep_inputs(sent_spans_df, tokenizer)
-    assert input_cases.index.values.tolist() == list(range(len(input_cases)))
-
-    stopping_doc_ids = _stopping_slice_doc_ids(sent_spans_df, doc_df)
+    in_train = sent_spans_df.split == "train"
+    doc_in_train = doc_df.split == "train"
+    stopping_doc_ids = _stopping_slice_doc_ids(sent_spans_df[in_train], doc_df[doc_in_train])
     in_stopping = sent_spans_df.document_id.isin(stopping_doc_ids)
-    train_idxs = input_cases[~in_stopping].index.values
-    stop_idxs = input_cases[in_stopping].index.values
-    stop_doc_df = doc_df[doc_df.id_doc.isin(stopping_doc_ids)]
+    train_idxs = sent_spans_df.index[in_train & ~in_stopping].values
+    stop_idxs = sent_spans_df.index[in_train & in_stopping].values
+    test_idxs = sent_spans_df.index[sent_spans_df.split == "test"].values
+    doc_df["stopping_slice"] = doc_in_train & doc_df.id_doc.isin(stopping_doc_ids)
+    stop_doc_df = doc_df[doc_df.stopping_slice]
+    test_doc_df = doc_df[doc_df.split == "test"]
 
     doc_eval_kwargs = _make_doc_eval_kwargs(case_id, tokenizer, doc_sent_boundaries, cfg.device)
-
-    _, stop_doc_preds, _ = _run_attempts(
+    stop_doc_preds, test_preds = _run_attempts(
         sent_spans_df,
         tokenized,
         tokenizer,
@@ -387,9 +325,23 @@ def finetune_final(sent_spans_df, doc_df, case_id, cfg: TrainConfig, doc_sent_bo
         train_idxs,
         stop_idxs,
         stop_doc_df,
-        fold_label="final",
+        test_idxs,
+        test_doc_df,
     )
-    return stop_doc_preds.drop(columns=["pred_label"])
+    sent_spans_df["pred"] = np.nan
+    sent_spans_df.loc[test_idxs, "pred"] = test_preds.sent_scores
+
+    # The winning attempt already scored the stopping slice (while picking its checkpoint) and the test split, so only
+    # the rest of the train split is left
+    train_doc_df = doc_df[doc_in_train & ~doc_df.stopping_slice]
+    logger.info(f"Predicting {len(train_doc_df)} train-split docs (in-sample, for label auditing)")
+    model = _load_best_model(cfg.model_base, tmp_best_loc(case_id), cfg.device)
+    train_doc_preds = inference.attach_predictions(
+        train_doc_df, **doc_eval_kwargs, model=model, batch_size=cfg.batch_size // 2
+    )
+    doc_preds = pd.concat([train_doc_preds, stop_doc_preds, test_preds.doc_pred]).set_index("id_doc")
+    doc_df = doc_df.join(doc_preds.reindex(columns=DOC_PRED_COLS), on="id_doc")
+    return sent_spans_df, doc_df
 
 
 def _run_attempts(
@@ -402,35 +354,32 @@ def _run_attempts(
     train_idxs,
     stop_idxs,
     stop_doc_df,
-    fold_label,
-    test_idxs=None,
-    test_doc_df=None,
-) -> tuple[float, pd.DataFrame, TestFoldPreds | None]:
+    test_idxs,
+    test_doc_df,
+) -> tuple[pd.DataFrame, TestPreds]:
     """
-    Trains cfg.attempts_per_fold models on `train_idxs`, using the stopping slice (`stop_idxs` sent spans,
-    `stop_doc_df` docs) for early stopping and model selection. The best model across attempts, by doc AP on the
-    stopping slice, ends up in tmp_best_loc(case_id). An attempt whose model collapses (_is_collapsed) is retrained
-    with a fresh seed, up to MAX_COLLAPSE_RETRIES times, and only the retry takes part in selection.
+    Trains cfg.attempts models on `train_idxs`, using the stopping slice (`stop_idxs` sent spans, `stop_doc_df` docs)
+    for early stopping and model selection. The best model across attempts, by doc AP on the stopping slice, ends up
+    in tmp_best_loc(case_id). An attempt whose model collapses (_is_collapsed) is retrained with a fresh seed, up to
+    MAX_COLLAPSE_RETRIES times, and only the retry takes part in selection.
 
-    In CV mode the caller also passes the fold's held-out test data (`test_idxs`, `test_doc_df`). Each attempt
-    predicts it after training, purely so per-fold and per-attempt variance is visible in wandb under test/ —
-    selection still runs off the stopping slice alone, which is what keeps those predictions honestly out-of-fold
-    for thresholds.py.
-    :return: the best stopping-slice doc AP, the corresponding stopping-slice doc predictions, and the winning
-        attempt's test-fold predictions (None with --train_final, which has no test fold)
+    Each attempt also predicts the test split (`test_idxs`, `test_doc_df`) after training, so per-attempt variance is
+    visible in wandb under test/. Selection still runs off the stopping slice alone, which is what keeps the test
+    predictions honest for thresholds.py.
+    :return: the winning attempt's stopping-slice doc predictions and test-split predictions
     """
     title = sent_spans_df.iloc[0].title
     best_metric = -1.0
     best_stop_doc_preds = None
     best_test_preds = None
-    for attempt in range(cfg.attempts_per_fold):
+    for attempt in range(cfg.attempts):
         attempt_test_preds = None
         for retry in range(MAX_COLLAPSE_RETRIES + 1):
             # Retries step by 1000 so they can't reuse another attempt's seed
             seed = 42 + attempt + 1000 * retry
             logger.info(f"Case id {case_id}: {title}")
             retry_label = f", collapse retry {retry} / {MAX_COLLAPSE_RETRIES}" if retry else ""
-            logger.info(f"{fold_label}, attempt {attempt + 1} / {cfg.attempts_per_fold}{retry_label}")
+            logger.info(f"Attempt {attempt + 1} / {cfg.attempts}{retry_label}")
             logger.info(f"{len(train_idxs)} train instances, {len(stop_idxs)} stopping-slice instances")
             logger.info(f"{len(stop_doc_df)} stopping-slice doc instances")
             run = None
@@ -438,16 +387,16 @@ def _run_attempts(
                 run = wandb.init(
                     project="tosdr_cases",
                     group=str(case_id),
-                    name=f"{case_id}-{fold_label}-a{attempt}" + (f"-r{retry}" if retry else ""),
-                    job_type="final" if fold_label == "final" else "cv",
+                    name=f"{case_id}-a{attempt}" + (f"-r{retry}" if retry else ""),
+                    job_type="train",
                     config=dict(
                         case_id=case_id,
                         case_title=title,
-                        fold=fold_label,
                         attempt=attempt,
                         retry=retry,
                         seed=seed,
                         model_base=cfg.model_base,
+                        learning_rate=cfg.learning_rate,
                         dataset_version=CLASSIFICATION_VERSION,
                     ),
                 )
@@ -470,34 +419,30 @@ def _run_attempts(
                 if run is not None:
                     run.summary["collapsed"] = collapsed
                 if collapsed and retry < MAX_COLLAPSE_RETRIES:
-                    # Skip test-fold prediction and attempt selection for this run; the retry replaces it
-                    logger.warning(f"{fold_label} attempt {attempt + 1} collapsed (seed {seed}); retrying")
+                    # Skip test prediction and attempt selection for this run; the retry replaces it
+                    logger.warning(f"Attempt {attempt + 1} collapsed (seed {seed}); retrying")
                     continue
                 if collapsed:
                     logger.warning(
-                        f"{fold_label} attempt {attempt + 1} still collapsed after {MAX_COLLAPSE_RETRIES} retries; "
-                        "keeping it, so attempt selection decides"
+                        f"Attempt {attempt + 1} still collapsed after {MAX_COLLAPSE_RETRIES} retries; keeping it, so "
+                        "attempt selection decides"
                     )
-                if test_idxs is not None:
-                    attempt_test_preds = _predict_test_fold(
-                        sent_spans_df,
-                        tokenized,
-                        tokenizer,
-                        case_id,
-                        cfg,
-                        doc_eval_kwargs,
-                        test_idxs,
-                        test_doc_df,
-                        tmp_attempt_best_loc(case_id),
-                    )
+                attempt_test_preds = _predict_test(
+                    sent_spans_df,
+                    tokenized,
+                    tokenizer,
+                    case_id,
+                    cfg,
+                    doc_eval_kwargs,
+                    test_idxs,
+                    test_doc_df,
+                    tmp_attempt_best_loc(case_id),
+                )
                 if run is not None:
-                    # The metric attempt selection actually uses (doc AP of the attempt's best checkpoint). Runs
-                    # before the switch to AP selection logged attempt_stop_doc_f1 instead
+                    # The metric attempt selection actually uses (doc AP of the attempt's best checkpoint)
                     run.summary["attempt_stop_doc_ap"] = stop_doc_ap
-                    if attempt_test_preds is not None:
-                        # Summary rather than log: one value per run, so wandb can table/scatter them across the
-                        # fold and attempt config fields to show variance
-                        run.summary.update(attempt_test_preds.metrics)
+                    # Summary rather than log: one value per run, so wandb can table/scatter them across attempts
+                    run.summary.update(attempt_test_preds.metrics)
             break
         if stop_doc_ap > best_metric:
             best_metric = stop_doc_ap
@@ -509,8 +454,8 @@ def _run_attempts(
             shutil.copytree(tmp_attempt_best_loc(case_id), tmp_best_loc(case_id))
 
     # Always set on the first attempt since stop_doc_ap >= 0 > best_metric's initial -1.0
-    assert best_stop_doc_preds is not None
-    return best_metric, best_stop_doc_preds, best_test_preds
+    assert best_stop_doc_preds is not None and best_test_preds is not None
+    return best_stop_doc_preds, best_test_preds
 
 
 def _train_one_attempt(
@@ -620,8 +565,8 @@ def _is_collapsed(stop_sent_metrics: dict, stop_labels: np.ndarray) -> bool:
     """
     A collapsed run's saved checkpoint predicts no positive sentences on the stopping slice despite it containing
     positives (sent F1 of 0 at the argmax threshold). The same failure shows up downstream as test/sent_f1_pos == 0.
-    This is checked on the stopping slice rather than the test fold so that the test fold still plays no part in any
-    selection decision, retries included.
+    This is checked on the stopping slice rather than the test split so that the test split still plays no part in
+    any selection decision, retries included.
     """
     if not stop_labels.any():
         # f1_pos is 0 by definition without positives, so a retry could never get out of it
@@ -629,13 +574,11 @@ def _is_collapsed(stop_sent_metrics: dict, stop_labels: np.ndarray) -> bool:
     return stop_sent_metrics.get("eval_f1_pos", 0.0) == 0.0
 
 
-def results_dir(results_key, final=False) -> Path:
+def results_dir(results_key) -> Path:
     """Local prediction cache dir for a training run. `results_key` is the model version, or a timestamp for
     throwaway experiments. Lives under data/training/ — data/results/ holds production inference outputs
-    (apply_docbot.py). CV and final live in separate subdirs because both write doc_pred.pkl and train_serial
-    uses its presence to skip completed cases — sharing a dir would make a final run mistake CV results for
-    its own."""
-    return here / f"../../data/training/{results_key}" / ("final" if final else "cv")
+    (apply_docbot.py)."""
+    return here / f"../../data/training/{results_key}"
 
 
 def results_by_case(results_key) -> pd.DataFrame:
@@ -650,13 +593,16 @@ def results_by_case(results_key) -> pd.DataFrame:
     dump_version = make_classification_datasets.DB_DUMP_VERSION
     cases = pickle.load(open(here / f"../../data/db_dumps/{dump_version}/cases_clean.pkl", "rb"))
     for case_id in sent_span_results:
-        # The sent span eval logic sets a "pred" score float. We'll find the optimal threshold that maximizes f1
+        # The sent span eval logic sets a "pred" score float (test split only). We'll find the optimal threshold that
+        # maximizes f1
         eval_set = sent_span_results[case_id][~sent_span_results[case_id].pred.isna()]
         int_labels = [0 if i == "negative" else 1 for i in eval_set.label]
         cases.at[case_id, "sent_span_f1"] = utils.optimal_threshold(eval_set.pred, int_labels)[3]
 
     for case_id in doc_results:
-        eval_set = doc_results[case_id][~doc_results[case_id].pred_score.isna()]
+        # Train-split docs are scored too, but in-sample
+        doc_df = doc_results[case_id]
+        eval_set = doc_df[(doc_df.split == "test") & doc_df.pred_score.notna()]
         int_labels = [0 if i == "negative" else 1 for i in eval_set.label]
         cases.at[case_id, "doc_f1"] = utils.optimal_threshold(eval_set.pred_score, int_labels)[3]
 
@@ -695,56 +641,24 @@ def _upload_df(s3_client, df: pd.DataFrame, key, metadata):
 
 def upload_results(model_version, case_id, sent_pred_df, doc_pred_df):
     """
-    Uploads a case's CV artifacts (out-of-fold predictions plus the last fold's adapter) under
-    {model_version}/cv/, so threshold selection can be revisited later without retraining. The cv/ subdir keeps
-    fold adapters away from {model_version}/{case_id}/ — the production path apply_docbot.py pulls from — so a
-    partially completed final run can never serve a CV fold model.
+    Uploads a case's model and predictions to {model_version}/{case_id}/, the layout production inference
+    (apply_docbot.py) reads: the LoRA adapter, plus the sent-span and doc predictions so thresholds can be
+    recomputed and labels audited later without retraining (train_pull.py). Production skips a case until
+    thresholds.py has uploaded its thresholds.json there too.
     """
     s3_client = boto3.client("s3", region_name=train_push.AWS_REGION)
     metadata = {"host": socket.gethostname()}
-    prefix = f"{model_version}/cv/{case_id}"
+    prefix = f"{model_version}/{case_id}"
     _upload_df(s3_client, sent_pred_df, f"{prefix}/{case_id}_sents.parquet", metadata)
     _upload_df(s3_client, doc_pred_df, f"{prefix}/{case_id}_docs.parquet", metadata)
     for filepath in _adapter_files(case_id):
         _upload_file(s3_client, filepath, f"{prefix}/{filepath.name}", metadata)
 
 
-def upload_final_results(model_version, case_id, final_eval_doc_df):
-    """
-    Uploads everything needed to use the final full-data model in production: the LoRA adapter, the thresholds
-    menu (written into the model version dir by thresholds.py after a CV run), and the stopping-slice doc
-    predictions for calibration sanity checks in pr_curves.ipynb. These land at {model_version}/{case_id}/,
-    the layout production inference (apply_docbot.py) reads.
-    """
-    check_final_trainable(case_id, model_version)
-    thresholds_path = inference.model_dir(case_id, model_version) / "thresholds.json"
-
+def already_uploaded(model_version, case_id) -> bool:
     s3_client = boto3.client("s3", region_name=train_push.AWS_REGION)
-    metadata = {"host": socket.gethostname()}
-    prefix = f"{model_version}/{case_id}"
-    _upload_df(s3_client, final_eval_doc_df, f"{prefix}/{case_id}_final_eval_docs.parquet", metadata)
-    for filepath in _adapter_files(case_id) + [thresholds_path]:
-        _upload_file(s3_client, filepath, f"{prefix}/{filepath.name}", metadata)
-
-
-def check_final_trainable(case_id, model_version):
-    """Fail fast — before hours of training — if threshold selection hasn't been run for this case"""
-    thresholds_path = inference.model_dir(case_id, model_version) / "thresholds.json"
-    if not thresholds_path.exists():
-        raise FileNotFoundError(
-            f"{thresholds_path} not found. Run thresholds.py with --model_version {model_version} on the CV "
-            "results before training/uploading a final model"
-        )
-
-
-def already_uploaded(model_version, case_id, final=False) -> bool:
-    s3_client = boto3.client("s3", region_name=train_push.AWS_REGION)
-    if final:
-        s3_obj_name = f"{model_version}/{case_id}/{case_id}_final_eval_docs.parquet"
-    else:
-        s3_obj_name = f"{model_version}/cv/{case_id}/{case_id}_sents.parquet"
     try:
-        s3_client.head_object(Bucket=RESULTS_S3_BUCKET, Key=s3_obj_name)
+        s3_client.head_object(Bucket=RESULTS_S3_BUCKET, Key=f"{model_version}/{case_id}/{case_id}_docs.parquet")
         return True
     except botocore.exceptions.ClientError as e:
         if e.response["Error"]["Code"] == "404":
@@ -784,13 +698,13 @@ def train_serial(args, cfg: TrainConfig, dataset_dict, doc_dataset_dict, doc_sen
     """
     Method 1 of running: single process
     Looping through all cases. May take days to train. Results are saved locally as pickled dictionaries from
-    case_id to dataframes that include predictions using the best model (as measured by AP on the doc dataset).
+    case_id to dataframes that include predictions using the best model (as measured by doc AP on the stopping slice).
     Results are written/cached after each case model, so if this crashes you can restart with the same
     --model_version and already-trained cases will be skipped. Rerunning a version after a code or dataset change
-    hits the same cache — delete data/training/{model_version}/ first to retrain from scratch.
+    hits the same cache — delete data/training/{model_version}/{sent_span,doc}_pred.pkl first to retrain from scratch.
     """
     results_key = args.model_version or ("test" if args.debug else str(int(time.time())))
-    out_dir = results_dir(results_key, final=args.train_final)
+    out_dir = results_dir(results_key)
     logger.info(f"Caching results in {out_dir}")
     if not args.model_version:
         logger.info(f"(pass --model_version {results_key} to resume this run after a crash)")
@@ -811,45 +725,26 @@ def train_serial(args, cfg: TrainConfig, dataset_dict, doc_dataset_dict, doc_sen
     case_ids = list(dataset_dict.keys())
     random.shuffle(case_ids)
     for case_id in case_ids:
-        # Final mode produces no sent span predictions, so completion is tracked via the doc results
-        if case_id in (docs_pred_local if args.train_final else sent_pred_local):
+        if case_id in sent_pred_local:
             logger.info(f"Skipping {case_id}: already in local results")
             continue
-        if args.upload and already_uploaded(args.model_version, case_id, final=args.train_final):
+        if args.upload and already_uploaded(args.model_version, case_id):
             logger.info(f"Skipping {case_id}: results already in S3")
             continue
-        if args.train_final and args.upload:
-            check_final_trainable(case_id, args.model_version)
 
         doc_output_path.parent.mkdir(exist_ok=True, parents=True)
-        if args.train_final:
-            final_eval_doc_df = finetune_final(
-                dataset_dict[case_id], doc_dataset_dict[case_id], case_id, cfg, doc_sent_boundaries
-            )
-            docs_pred_local[case_id] = final_eval_doc_df.copy()
-            pickle.dump(docs_pred_local, open(doc_output_path, "wb"))
+        sent_pred_df, doc_pred_df = finetune(
+            dataset_dict[case_id], doc_dataset_dict[case_id], case_id, cfg, doc_sent_boundaries
+        )
+        sent_pred_local[case_id] = sent_pred_df.copy()
+        docs_pred_local[case_id] = doc_pred_df.copy()
 
-            if args.upload:
-                upload_final_results(args.model_version, case_id, final_eval_doc_df)
-                cleanup_case_models(case_id)
-        else:
-            sent_pred_df, doc_pred_df = finetune(
-                dataset_dict[case_id],
-                doc_dataset_dict[case_id],
-                case_id,
-                cfg,
-                doc_sent_boundaries,
-                cv_folds=args.cv_folds,
-            )
-            sent_pred_local[case_id] = sent_pred_df.copy()
-            docs_pred_local[case_id] = doc_pred_df.copy()
+        pickle.dump(sent_pred_local, open(sent_span_output_path, "wb"))
+        pickle.dump(docs_pred_local, open(doc_output_path, "wb"))
 
-            pickle.dump(sent_pred_local, open(sent_span_output_path, "wb"))
-            pickle.dump(docs_pred_local, open(doc_output_path, "wb"))
-
-            if args.upload:
-                upload_results(args.model_version, case_id, sent_pred_df, doc_pred_df)
-                cleanup_case_models(case_id)
+        if args.upload:
+            upload_results(args.model_version, case_id, sent_pred_df, doc_pred_df)
+            cleanup_case_models(case_id)
 
 
 def train_parallel(args, cfg: TrainConfig, dataset_dict, doc_dataset_dict, doc_sent_boundaries):
@@ -892,35 +787,20 @@ def train_parallel(args, cfg: TrainConfig, dataset_dict, doc_dataset_dict, doc_s
                 if found_key != args.model_version:
                     raise Exception(f"Different model_version found {found_key} != {args.model_version}")
 
-                if args.upload and already_uploaded(args.model_version, case_id, final=args.train_final):
+                if args.upload and already_uploaded(args.model_version, case_id):
                     logger.info(f"Skipping case {case_id}: results already in S3")
                     sqs_client.delete_message(QueueUrl=train_push.parallel_queue_name(), ReceiptHandle=receipt_handle)
                     continue
-                if args.train_final and args.upload:
-                    check_final_trainable(case_id, args.model_version)
 
                 # Trainings run far longer than any reasonable queue visibility timeout, so keep the message
                 # invisible to other workers while we work on it
                 with _visibility_heartbeat(sqs_client, receipt_handle):
-                    if args.train_final:
-                        final_eval_doc_df = finetune_final(
-                            dataset_dict[case_id], doc_dataset_dict[case_id], case_id, cfg, doc_sent_boundaries
-                        )
-                        if args.upload:
-                            upload_final_results(args.model_version, case_id, final_eval_doc_df)
-                            cleanup_case_models(case_id)
-                    else:
-                        sent_pred_df, doc_pred_df = finetune(
-                            dataset_dict[case_id],
-                            doc_dataset_dict[case_id],
-                            case_id,
-                            cfg,
-                            doc_sent_boundaries,
-                            cv_folds=args.cv_folds,
-                        )
-                        if args.upload:
-                            upload_results(args.model_version, case_id, sent_pred_df, doc_pred_df)
-                            cleanup_case_models(case_id)
+                    sent_pred_df, doc_pred_df = finetune(
+                        dataset_dict[case_id], doc_dataset_dict[case_id], case_id, cfg, doc_sent_boundaries
+                    )
+                    if args.upload:
+                        upload_results(args.model_version, case_id, sent_pred_df, doc_pred_df)
+                        cleanup_case_models(case_id)
 
                 # Delete received message from queue
                 sqs_client.delete_message(QueueUrl=train_push.parallel_queue_name(), ReceiptHandle=receipt_handle)
@@ -946,7 +826,9 @@ if __name__ == "__main__":
         help="Train all ~150 case models, instead of just enough to optimize. If --parallel is "
         "set this is ignored, and training assignments come from SQS",
     )
-    parser.add_argument("--eval_training", action="store_true", help="Evaluate training set alongside the test set")
+    parser.add_argument(
+        "--eval_training", action="store_true", help="Evaluate a training subset alongside the stopping slice"
+    )
     parser.add_argument(
         "--parallel",
         action="store_true",
@@ -956,34 +838,26 @@ if __name__ == "__main__":
     parser.add_argument(
         "--upload",
         action="store_true",
-        help="Upload results to S3 under the model version: CV runs put LORA models and test-fold predictions in "
-        "{model_version}/cv/, --train_final puts production artifacts in {model_version}/. Requires --model_version",
+        help="Upload each case's LoRA adapter and predictions to S3 at {model_version}/{case_id}/, the production "
+        "layout. Production only picks a case up once thresholds.py has added its thresholds.json there. Requires "
+        "--model_version",
     )
     parser.add_argument("--model_base", type=str, choices=list(MODEL_BASES), default="bert-base-uncased")
-    parser.add_argument(
-        "--train_final",
-        action="store_true",
-        help="Train production models on all data except a small stopping slice, instead of running CV. "
-        "Requires thresholds.json to already exist per case (run thresholds.py on a prior CV run first)",
-    )
     parser.add_argument(
         "--model_version",
         type=str,
         required=False,
         help="Production model version being prepared (e.g. v4). Names the local results cache "
-        "(data/training/{model_version}/) and the S3 prefix for uploads; final uploads read each case's "
-        "thresholds.json from data/models/{model_version}/{case_id}/. Omit for throwaway experiments, which "
+        "(data/training/{model_version}/) and the S3 prefix for uploads. Omit for throwaway experiments, which "
         "cache under a timestamp instead. Required with --upload or --parallel",
     )
     parser.add_argument("--batch_size", type=int, default=32, help="Default is ideal for 24gb GPU memory")
     parser.add_argument("--learning_rate", type=float, default=5e-04)
-    parser.add_argument("--attempts_per_fold", type=int, default=1)
     parser.add_argument(
-        "--cv_folds",
+        "--attempts",
         type=int,
-        default=None,
-        help="Number of CV folds to train/evaluate (ignored with --train_final). Defaults to all pre-assigned folds, "
-        "which is what threshold selection in thresholds.py needs",
+        default=1,
+        help="Models trained per case with different seeds; the best on the stopping slice ships",
     )
     parser.add_argument("--eval_steps", type=int, default=8)
     parser.add_argument("--num_train_epochs", type=int, default=50)
@@ -1022,7 +896,9 @@ if __name__ == "__main__":
         if key in cases_to_train:
             if args.debug:
                 dataset_dict[key] = dataset_dict[key].sample(200, random_state=0).reset_index(drop=True)
-                doc_dataset_dict[key] = doc_dataset_dict[key].groupby(["fold", "label"]).head(10).reset_index(drop=True)
+                doc_dataset_dict[key] = (
+                    doc_dataset_dict[key].groupby(["split", "label"]).head(10).reset_index(drop=True)
+                )
         else:
             del dataset_dict[key]
             del doc_dataset_dict[key]
@@ -1037,7 +913,7 @@ if __name__ == "__main__":
         log_wandb = False
         device = "mps"
         args.batch_size = 4
-        args.attempts_per_fold = 2
+        args.attempts = 2
         args.eval_steps = 10
         args.learning_rate = 1e-04
         args.num_train_epochs = 1
@@ -1053,7 +929,7 @@ if __name__ == "__main__":
         eval_steps=args.eval_steps,
         early_stopping_patience=args.early_stopping_patience,
         num_train_epochs=args.num_train_epochs,
-        attempts_per_fold=args.attempts_per_fold,
+        attempts=args.attempts,
         eval_training_set=args.eval_training,
         device=device,
         log_wandb=log_wandb,

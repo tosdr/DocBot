@@ -34,13 +34,20 @@ BASE_MODEL_NAME = "bert-base-uncased"
 # This has to match the upload key specified when training. It will also be used by apply_docbot.py to record whether
 # docbot has already ran docs, so if we train a new model and want to rerun, this should be updated.
 MODEL_VERSION = "v3"
+# The TF-IDF prefilter version (tfidf.py) the production case models were evaluated with. Update alongside
+# MODEL_VERSION: v4 models go with tfidf_v3
+PREFILTER_VERSION = "tfidf_v2"
 
 # The operating point apply_docbot uses from each case's thresholds.json menu (see sent_spans/thresholds.py).
 # Other consumers (e.g. auto-approval) can request a precision tier like "precision90" instead.
 DEFAULT_OPERATING_POINT = "fbeta15"
 
+# Model versions that predate the per-case thresholds.json artifacts, and so use THRESHOLDS below instead. Any later
+# version must have a thresholds.json for every case it serves
+LEGACY_THRESHOLD_VERSIONS = {"v3"}
+
 # DEPRECATED: case-specific thresholds for v3 models, which predate the per-case thresholds.json artifacts.
-# get_threshold() falls back to this dict when no artifact exists; delete it once MODEL_VERSION moves past v3.
+# get_threshold() falls back to this dict for LEGACY_THRESHOLD_VERSIONS; delete it once MODEL_VERSION moves past v3.
 # These come from the old pr_curves.ipynb flow, and optimize fscore with beta=1.5
 THRESHOLDS = {
     117: 0.9313029646873474,
@@ -180,24 +187,22 @@ def get_threshold(case_id: int, operating_point: str = DEFAULT_OPERATING_POINT) 
     """
     Returns the case's decision threshold for the requested operating point, from the thresholds.json menu
     written by sent_spans/thresholds.py. Falls back to the legacy THRESHOLDS dict for model versions that
-    predate the artifacts (v3).
+    predate the artifacts (LEGACY_THRESHOLD_VERSIONS). Any other version without a thresholds.json is an error rather
+    than a fallback, since legacy thresholds are on another model's score scale.
     """
     thresholds_path = model_dir(case_id) / "thresholds.json"
     if not thresholds_path.exists():
-        if case_id in THRESHOLDS:
+        if MODEL_VERSION in LEGACY_THRESHOLD_VERSIONS and case_id in THRESHOLDS:
             return THRESHOLDS[case_id]
-        raise KeyError(f"No thresholds.json at {thresholds_path} and no legacy threshold for case {case_id}")
+        raise KeyError(f"No thresholds.json at {thresholds_path} for case {case_id}")
 
     with open(thresholds_path) as f:
         artifact = json.load(f)
     for op in artifact["operating_points"]:
         if op["name"] == operating_point:
             if not op["attainable"] or op["threshold"] is None:
-                raise ValueError(f"Case {case_id} operating point {operating_point} was not attainable in CV")
-            if not op["stable"]:
-                logger.warning(
-                    f"Case {case_id} operating point {operating_point} had unstable CV fold thresholds "
-                    f"(std_logit {op['std_logit']:.2f}); using the conservative fallback threshold"
+                raise ValueError(
+                    f"Case {case_id} operating point {operating_point} was not attainable on the test split"
                 )
             return op["threshold"]
     raise KeyError(f"Operating point {operating_point} not found in {thresholds_path}")
@@ -218,10 +223,10 @@ def test_gpu_memory(batch_size, model, device, model_max_length):
     return
 
 
-def load_prefilter_kwargs(case_id):
+def load_prefilter_kwargs(case_id, version: str = PREFILTER_VERSION):
     from src.tfidf import model_output_dir
 
-    prefilter_dir = model_output_dir(case_id)
+    prefilter_dir = model_output_dir(case_id, version)
     return {
         "vectorizer": pickle.load(open(prefilter_dir / "vectorizer.pkl", "rb")),
         "model": pickle.load(open(prefilter_dir / "model.pkl", "rb")),
