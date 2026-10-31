@@ -1,4 +1,3 @@
-import copy
 import logging
 import pickle
 import random
@@ -10,9 +9,9 @@ from typing import Any, TypedDict
 import numpy as np
 import pandas as pd
 import spacy
-from sklearn.ensemble import RandomForestClassifier
+
+# from sklearn.ensemble import RandomForestClassifier  # For the commented-out RF setups in gen_setups
 from sklearn.linear_model import LogisticRegression, SGDClassifier
-from sklearn.metrics import average_precision_score, confusion_matrix, precision_recall_curve
 from sklearn.model_selection import StratifiedGroupKFold
 from textacy import extract
 from textacy.representations.vectorizers import Vectorizer
@@ -26,24 +25,38 @@ here = Path(__file__).parent
 
 DB_DUMP_VERSION = make_classification_datasets.DB_DUMP_VERSION
 RANDOM_STATE = 0
-random.seed(RANDOM_STATE)
 
 # The version this script trains, and that train.py evaluates new case models with. Production loads
 # inference.PREFILTER_VERSION instead, until the case models trained alongside this one ship. When that happens, be sure
 # to modify .dockerignore so the models are copied into the inference Docker image
-# tfidf_v3: trained on the train split only (make_classification_datasets.service_split)
+# tfidf_v3: trained on the train split only (make_classification_datasets.service_split), and thresholded by pass rate
+# (see below) instead of recall100 thresholds
 MODEL_VERSION = "tfidf_v3"
 
 """
-This script trains high recall TF-IDF classification models that can be used as prefilters, to avoid unnecessary 
-inference with our deep learning models for completely irrelevant sentences. For most cases it reduces inference 
-by 90-95% without dropping any positive examples in the cross-validation held-out folds.
+This script trains high recall TF-IDF classification models that can be used as prefilters, to avoid unnecessary
+inference with our deep learning models for completely irrelevant sentences.
 
-Only train-split docs are used (make_classification_datasets.service_split): the case models' thresholds are picked on
-test-split doc scores, which the prefilter shapes, so it mustn't have seen them either. Within the train split, each
-case's model setup and threshold are picked by cross-validation (train_cv), then a final model is fit on all of it.
+Only train-split docs are used for training and choosing thresholds (make_classification_datasets.service_split): the
+case models' thresholds are picked on test-split doc scores, which the prefilter shapes, so it mustn't have seen them
+either.
 
-Models are written to data/models/{MODEL_VERSION} and later added to the inference Docker image
+Thresholds are chosen as pass rates (the share of irrelevant sentences let through to BERT) rather than scores, since a
+pass rate means the same thing for every model. Per case:
+1. A 5-fold CV within the train split (train_cv). Every sentence is scored by the fold model that didn't train on it,
+   and gets a "pass rate needed": the fraction of its fold's held-out negatives scoring at least as high. Sorted, the
+   positives' pass rates needed trace the high-recall edge of the PR curve ("the cliff"), which
+   notebooks/tfidf_cliff.py plots.
+2. choose_pass_rate picks a pass rate on the cliff (exchange_rule).
+3. fit_full trains one model on every sentence, and finds the score threshold that lets through that pass rate. Its only
+   negatives are ones it trained on, which it scores lower than unseen ones, so the CV measures by how much and
+   corrects for it.
+
+Each case's output goes to data/models/{MODEL_VERSION}/{case_id}: vectorizer.pkl, model.pkl and final_metrics.pkl, which
+inference.load_prefilter_kwargs loads. For the notebook, and left out of Docker images, there's also cv.pkl with the CV
+scores, and test.pkl with the shipped model's scores on test-split sentences. The test split is for information only:
+choosing anything by it would let test-split labels shape the prefilter after all. The setup is fixed (SHIPPED_SETUP);
+--compare_setups also cross-validates the rest of gen_setups for the notebook.
 """
 
 
@@ -51,436 +64,250 @@ def model_output_dir(case_id, version: str = MODEL_VERSION) -> Path:
     return here / f"../data/models/{version}/{case_id}"
 
 
-def _find_pareto_frontier(precision, recall, thresholds, critical_recalls):
-    """
-    Find Pareto-optimal points on precision-recall curve. We also ensure we capture key recall levels.
-    Returns indices of Pareto-optimal points
-    """
-    if len(recall) == 0:
-        return np.array([])
-
-    # Sort by recall (ascending) then precision (descending)
-    sorted_idx = np.lexsort((-precision, recall))
-    precision = precision[sorted_idx]
-    recall = recall[sorted_idx]
-    thresholds = thresholds[sorted_idx]
-
-    # Find Pareto frontier: keep point if it has higher precision than all previous points
-    # (since we're moving in increasing recall direction)
-    pareto_idx = []
-    max_precision_seen = -1
-
-    for i in range(len(precision)):
-        if precision[i] > max_precision_seen:
-            pareto_idx.append(i)
-            max_precision_seen = precision[i]
-
-    pareto_idx = np.array(pareto_idx)
-
-    # Add critical recall thresholds if not already present
-    for target_recall in critical_recalls:
-        if recall.min() <= target_recall <= recall.max():
-            # Find closest point to target recall
-            closest_idx = np.argmin(np.abs(recall - target_recall))
-            if closest_idx not in pareto_idx:
-                pareto_idx = np.append(pareto_idx, closest_idx)
-
-    pareto_idx = np.unique(pareto_idx)
-    pareto_idx = np.sort(pareto_idx)
-
-    return sorted_idx[pareto_idx]
+def setups_output_path(case_id, version: str = MODEL_VERSION) -> Path:
+    # Not deployable, so outside data/models
+    return here / f"../data/tfidf/{version}/setups/{case_id}.pkl"
 
 
 def make_vectorizer() -> Vectorizer:
     return Vectorizer(tf_type="sqrt", idf_type="smooth", norm="l1", min_df=4, max_df=0.8)
 
 
-def summarize_metrics(metrics: dict, cv_folds: int, critical_recalls: list[float]) -> dict:
-    """
-    Transforms raw threshold_metrics from CV into a summary dict.
-
-    Args:
-        metrics: Dict with 'avg_precisions' and 'threshold_metrics' keys
-        cv_folds: Number of CV folds (used for validation)
-        critical_recalls: List of recall levels to extract (e.g., [1.0, 0.98, 0.95])
-
-    Returns:
-        Dict with:
-            'avg_precisions': [0.54, 0.48, ...]  # One per fold
-            'recall100_filterrates': [0.85, 0.87, ...]  # One per fold
-            'recall100_thresholds': [0.45, 0.43, ...]   # One per fold
-            'recall98_filterrates': [...]
-            'recall98_thresholds': [...]
-            ...
-    """
-    # Step 1: Organize threshold_metrics by fold
-    all_recall_filterrates: list[list[tuple[float, float, float]]] = [[] for _ in range(cv_folds)]
-    for threshold_option in metrics["threshold_metrics"]:
-        fold_idx = threshold_option["fold"]
-        all_recall_filterrates[fold_idx].append(
-            (threshold_option["recall"], threshold_option["filter_rate"], threshold_option["threshold"])
-        )
-
-    # Step 2: Sort each fold's options by recall (ascending)
-    sorted_filterrates = [sorted(options, key=lambda m: m[0]) for options in all_recall_filterrates]
-
-    # Step 3: For each critical recall, find best point per fold
-    critical_folds = {recall: [] for recall in critical_recalls}
-    for recall in critical_recalls:
-        for fold_options in sorted_filterrates:
-            # Find first option that meets or exceeds target recall
-            for option in fold_options:
-                if option[0] >= recall:
-                    critical_folds[recall].append((option[1], option[2]))
-                    break
-
-    # Step 4: Build summary dict
-    summary = {"avg_precisions": metrics["avg_precisions"]}
-    for recall in critical_recalls:
-        recall_str = f"recall{recall * 100:.0f}"
-        summary[f"{recall_str}_filterrates"] = [pair[0] for pair in critical_folds[recall]]
-        summary[f"{recall_str}_thresholds"] = [pair[1] for pair in critical_folds[recall]]
-
-    return summary
-
-
-def summarize_all_metrics(cv_results: list[dict], critical_recalls: list[float], cv_folds: int) -> pd.DataFrame:
-    """
-    Converts CV results list into a DataFrame for easy model comparison.
-
-    Args:
-        cv_results: List of dicts, each with model_class, model_kwargs, rebalance_to, and metrics
-        critical_recalls: List of recall levels (e.g., [1.0, 0.98, 0.95])
-        cv_folds: Number of CV folds
-
-    Returns:
-        DataFrame with columns:
-            - model_class_name: str (e.g., 'LogisticRegression')
-            - model_class: class object (for easy instantiation)
-            - model_kwargs: dict (original kwargs)
-            - rebalance_to: int or None
-            - avg_precision: float (mean across folds)
-            - recall100_filterrate: float (mean across folds)
-            - recall100_threshold_rel_std: float (std / mean of the fold thresholds)
-            - recall98_filterrate, recall98_threshold_rel_std, etc.
-    """
-    res_df = []
-    for idx, model in enumerate(cv_results):
-        # Step 1: Extract model configuration (keep as objects/dicts, don't expand)
-        model_dict = {
-            "cv_result_idx": idx,  # Track index for easy lookup
-            "model_class_name": model["model_class"].__name__,
-            "model_class": model["model_class"],
-            "model_kwargs": model["model_kwargs"],
-            "rebalance_to": model["rebalance_to"],
-        }
-
-        # Step 2: Summarize metrics for this model
-        metrics_summary = summarize_metrics(model["metrics"], cv_folds, critical_recalls)
-
-        # Step 3: Aggregate across folds
-        model_dict["avg_precision"] = np.mean(metrics_summary["avg_precisions"])
-
-        for recall in critical_recalls:
-            recall_str = f"recall{recall * 100:.0f}"
-            # Mean filter rate across folds
-            model_dict[f"{recall_str}_filterrate"] = np.mean(metrics_summary[f"{recall_str}_filterrates"])
-
-            thresholds = metrics_summary[f"{recall_str}_thresholds"]
-            model_dict[f"{recall_str}_thresholds"] = thresholds
-
-            # Relative std dev of fold thresholds (std / mean, a.k.a. coefficient of variation)
-            model_dict[f"{recall_str}_threshold_rel_std"] = np.std(thresholds) / np.mean(thresholds)
-
-        res_df.append(model_dict)
-
-    return pd.DataFrame(res_df)
-
-
 class Setup(TypedDict):
+    name: str
     model_class: type[Any]
     model_kwargs: dict[str, Any]
-    rebalance_to: int | None
+
+
+# The gen_setups setup every case ships with. Over all cases, the 6 setups with a positive class weight >= 10 needed
+# about the same pass rate for 95% recall (within 0.2 points on average), and this one was within a point of each case's
+# best the most often. SGD cw=30 tied it
+SHIPPED_SETUP = "SGD cw=balanced"
+# exchange_rule's price of recall: one point of recall is worth MU points of pass rate
+MU = 8
 
 
 def gen_setups() -> Iterator[Setup]:
     # TODO also loop through the dataset labels (one with other topical positives, one without)
-    for model_class, model_kwargs in [
-        # saga solver is good for sparse data. l1_ratio=0 is pure L2, l1_ratio=0.5 is elasticnet
-        # (penalty= was deprecated in sklearn 1.8 in favor of l1_ratio/C)
-        (LogisticRegression, dict(l1_ratio=0, max_iter=5000, solver="saga")),
-        (LogisticRegression, dict(l1_ratio=0.5, max_iter=5000, solver="saga")),
-        (SGDClassifier, dict(loss="log_loss", penalty="l2", alpha=0.0001, max_iter=5000)),
-        # There was no clear winner for optimal regularization params, just try a bunch
-        (
-            RandomForestClassifier,
-            dict(n_estimators=100, max_depth=3, min_samples_split=8, min_samples_leaf=3, max_features="sqrt"),
-        ),
-        (
-            RandomForestClassifier,
-            dict(n_estimators=100, max_depth=5, min_samples_split=8, min_samples_leaf=3, max_features="sqrt"),
-        ),
-        (
-            RandomForestClassifier,
-            dict(n_estimators=100, max_depth=10, min_samples_split=8, min_samples_leaf=3, max_features="sqrt"),
-        ),
-        (
-            RandomForestClassifier,
-            dict(n_estimators=100, max_depth=5, min_samples_split=4, min_samples_leaf=3, max_features="sqrt"),
-        ),
-        (
-            RandomForestClassifier,
-            dict(n_estimators=100, max_depth=5, min_samples_split=12, min_samples_leaf=3, max_features="sqrt"),
-        ),
-        # For some reason ComplementNB does very poorly. I don't think I have negative values so that's not it
-        # (ComplementNB, dict(alpha=1.0, norm=False)),
-        # (ComplementNB, dict(alpha=0.1, norm=False)),
-        # TODO try GradientBoostingClassifier if it's not overkill
-    ]:
-        for rebalance_to in [20, None]:
-            setup: Setup = {"model_class": model_class, "model_kwargs": model_kwargs, "rebalance_to": rebalance_to}
-            if model_class.__name__ == "ComplementNB":
-                yield setup
-            else:
-                if model_class.__name__ == "RandomForestClassifier":
-                    weight_options = ["balanced_subsample"]
-                else:
-                    weight_options = [{0: 2.0, 1: 1.0}, {0: 1.0, 1: 1.0}, {0: 1.0, 1: 3.0}, {0: 1.0, 1: 5.0}]
-                for class_weight in weight_options:
-                    new_setup: Setup = copy.deepcopy(setup)
-                    new_setup["model_kwargs"]["class_weight"] = class_weight
-                    new_setup["model_kwargs"]["random_state"] = RANDOM_STATE
-                    yield new_setup
+    # Trimmed from the old grid: elastic-net LR and depth-3 RF were rarely the best setup across 84 cases, and with
+    # fewer setups, the best one is less likely to just be the luckiest
+    # Upweighting positives replaces the old rebalance_to option, which subsampled negatives to 20 per positive (about a
+    # 10x positive weight, plus sampling noise that alone swung held-out pass rates between 34% and 89% on case 297)
+    for weight in [1, 3, 10, 30, "balanced"]:
+        class_weight = weight if weight == "balanced" else {0: 1.0, 1: float(weight)}
+        # lbfgs rather than saga: on these l1-normed features saga didn't converge in 5000 iterations for weights >= 10
+        # (l1_ratio=0 is pure L2. penalty= was deprecated in sklearn 1.8 in favor of l1_ratio/C)
+        yield {
+            "name": f"LR cw={weight}",
+            "model_class": LogisticRegression,
+            "model_kwargs": dict(
+                l1_ratio=0, solver="lbfgs", max_iter=5000, class_weight=class_weight, random_state=RANDOM_STATE
+            ),
+        }
+        yield {
+            "name": f"SGD cw={weight}",
+            "model_class": SGDClassifier,
+            "model_kwargs": dict(
+                loss="log_loss",
+                penalty="l2",
+                alpha=0.0001,
+                max_iter=5000,
+                class_weight=class_weight,
+                random_state=RANDOM_STATE,
+            ),
+        }
+    # Random forests needed far more pass rate for 95% recall: a 22% mean over the first 15 cases, vs 9% for the best
+    # linear setups
+    # for max_depth in [5, 10]:
+    #     yield {
+    #         "name": f"RF depth={max_depth}",
+    #         "model_class": RandomForestClassifier,
+    #         "model_kwargs": dict(
+    #             n_estimators=100,
+    #             max_depth=max_depth,
+    #             min_samples_split=8,
+    #             min_samples_leaf=3,
+    #             max_features="sqrt",
+    #             class_weight="balanced_subsample",
+    #             random_state=RANDOM_STATE,
+    #         ),
+    #     }
+    # For some reason ComplementNB does very poorly. I don't think I have negative values so that's not it
+    # TODO try GradientBoostingClassifier if it's not overkill
+
+
+def fit_setup(setup: Setup, X, y):
+    return setup["model_class"](**setup["model_kwargs"]).fit(X, y)
+
+
+def pass_rates_needed(scores: np.ndarray, negative_scores: np.ndarray) -> np.ndarray:
+    """For each score, the fraction of negative_scores at least as high: the pass rate it needs to get through"""
+    negatives = np.sort(negative_scores)
+    return 1 - np.searchsorted(negatives, scores) / len(negatives)
+
+
+def threshold_for_pass_rate(negative_scores: np.ndarray, pass_rate: float) -> float:
+    """
+    The score threshold (sentences scoring at least this much get through) that lets through at most pass_rate of
+    negative_scores. Consistent with pass_rates_needed: a score gets through iff the pass rate it needs is <= pass_rate
+    """
+    negatives = np.sort(negative_scores)
+    n_through = int(np.floor(pass_rate * len(negatives) + 1e-9))
+    if n_through >= len(negatives):
+        return 0.0
+    # Just above the highest negative that's kept out
+    return float(np.nextafter(negatives[len(negatives) - n_through - 1], np.inf))
 
 
 def train_cv(
-    ngrams: list[list[str]],
-    sentence_labels: np.ndarray,
-    service_ids: np.ndarray,
-    model_outdir: Path,
-    critical_recalls,
-    cv_folds=5,
-    min_recall=0.8,
-) -> list[dict]:
+    ngrams: list[list[str]], labels: np.ndarray, service_ids: np.ndarray, setups: list[Setup], cv_folds=5
+) -> tuple[np.ndarray, pd.DataFrame]:
     """
-    Returns a list of results describing different TF-IDF models/setups that we could use for a single case filter.
-    It also serializes the list as we iterate, in case of crash
+    Scores every sentence with the fold model that didn't train on it, for each setup.
 
     Folds are grouped by service, like make_classification_datasets.service_split, so sentences from one service's docs
     (near-duplicate docs, or several sentences sampled from one doc) can't land on both sides of a fold and inflate
-    held-out scores. Each fold also fits its own vectorizer, so held-out sentences don't shape the vocabulary or IDF.
+    held-out scores. Each fold gets its own vectorizer, fit on its training sentences only, like the full model's. One
+    shared by all folds would also have seen the held-out sentences, so their rare words would stay in their vectors
+    (with near-zero weight), instead of dropping out as an unseen sentence's do. In a nested simulation over all cases,
+    that made held-out negatives score lower than unseen ones, and the pass rates came out 10% too low.
 
-    A single result is a dictionary, with setup parameters used and a `metrics` dict, format:
-    metrics = {
-        'avg_precisions': [.54, .483, ...],
-        'threshold_metrics': [
-            {
-                # Threshold option 1
-                'fold': 1,
-                'threshold': threshold,
-                'precision': precisions[idx],
-                'recall': recalls[idx],
-                # Key metric: what % of data can we filter while maintaining high recall
-                'filter_rate': tn / len(y_val)
-            }, {
-                # Threshold option 2
-                'fold': 1,
-                'threshold': threshold,
-                'precision': precisions[idx],
-                'recall': recalls[idx],
-                # Key metric: what % of data can we filter while maintaining high recall
-                'filter_rate': tn / len(y_val)
-            },
-            ...
-        ]
-    }
+    Returns each sentence's held-out fold, and a long DataFrame with one row per setup x sentence:
+        setup: gen_setups name, e.g. "LR cw=3"
+        row: index into ngrams
+        score: predicted probability from the fold model that held the sentence out
+        pass_rate_needed: the fraction of that fold's held-out negatives scoring at least as high, i.e. the pass rate of
+            the strictest threshold that still keeps this sentence. It's computed from negatives only, so for positives
+            it's an honest held-out estimate
+        in_sample_pass_rate_needed: the same, but against the fold model's own training negatives. It's needed to
+            calibrate the full model, which has no other negatives (see choose_pass_rate)
     """
-    results_filepath = model_outdir / "cv_results.pkl"
-
-    # Vectorize each fold once, since every setup shares the folds
-    logger.info("Vectorizing folds")
     sgkf = StratifiedGroupKFold(n_splits=cv_folds, shuffle=True, random_state=RANDOM_STATE)
-    folds = []
-    for fold_idx, (train_idx, val_idx) in enumerate(sgkf.split(np.zeros(len(ngrams)), sentence_labels, service_ids)):
+    folds = np.empty(len(ngrams), dtype=int)
+    for fold_idx, (_, val_idx) in enumerate(sgkf.split(np.zeros(len(ngrams)), labels, service_ids)):
+        folds[val_idx] = fold_idx
+    logger.info(f"Positives per fold: {np.bincount(folds[labels == 1], minlength=cv_folds).tolist()}")
+
+    # Vectorize each fold once, for all setups
+    fold_data = []
+    for fold_idx in range(cv_folds):
+        train_idx, val_idx = np.where(folds != fold_idx)[0], np.where(folds == fold_idx)[0]
         vectorizer = make_vectorizer()
         X_train = vectorizer.fit_transform([ngrams[i] for i in train_idx])
         X_val = vectorizer.transform([ngrams[i] for i in val_idx])
-        y_train, y_val = sentence_labels[train_idx], sentence_labels[val_idx]
-        folds.append((X_train, X_val, y_train, y_val))
-        logger.info(f"Fold {fold_idx}: train {X_train.shape}, val {X_val.shape}, {y_val.sum()} val positives")
+        fold_data.append((train_idx, val_idx, X_train, X_val))
 
-    results: list[dict] = []
-    setups = list(gen_setups())
-    for setup_dict in tqdm(setups, desc="Trying setups"):
-        metrics = {"avg_precisions": [], "threshold_metrics": []}
-
-        logger.info(f"Training {setup_dict['model_class'].__name__} {setup_dict['model_kwargs']}")
-        for fold_idx, (X_train, X_val, y_train, y_val) in enumerate(folds):
-            rebalance_to = setup_dict["rebalance_to"]
-            if rebalance_to is not None:
-                pos_idx = np.where(y_train == 1)[0]
-                neg_idx = np.where(y_train == 0)[0]
-
-                # Keep all positives, sample negatives at desired ratio
-                # For 1:150 imbalance, might want 1:10 or 1:20 for training
-                target_ratio = min(rebalance_to, len(neg_idx) // len(pos_idx))
-                neg_sample_size = int(len(pos_idx) * target_ratio)
-
-                neg_sample_idx = np.random.choice(neg_idx, size=neg_sample_size, replace=False)
-                balanced_idx = np.concatenate([pos_idx, neg_sample_idx])
-                np.random.shuffle(balanced_idx)
-
-                X_train = X_train[balanced_idx]  # pyrefly: ignore[bad-index]  # scipy sparse stub lacks __getitem__
-                y_train = y_train[balanced_idx]
-                logger.debug(
-                    f"Rebalanced training: {len(pos_idx)} pos, {len(neg_sample_idx)} neg (1:{target_ratio} ratio)"
-                )
-
-            model = setup_dict["model_class"](**setup_dict["model_kwargs"])
-            model.fit(X_train, y_train)
-            y_proba = model.predict_proba(X_val)[:, 1]
-
-            # Get the full PR curve so we can consider all thresholds
-            precisions, recalls, thresholds = precision_recall_curve(y_val, y_proba)
-            #  precision_recall_curve returns n+1 precision/recall values but n thresholds. The last p/r is threshold=0
-            #  (all positive), add it to thresholds for completeness
-            thresholds = np.append(thresholds, 0)
-
-            # Filter by minimum recall
-            valid_idx = recalls >= min_recall
-            precisions = precisions[valid_idx]
-            recalls = recalls[valid_idx]
-            thresholds = thresholds[valid_idx]
-            pareto_idx = _find_pareto_frontier(precisions, recalls, thresholds, critical_recalls)
-
-            # Evaluate at different thresholds
-            for idx in pareto_idx:
-                threshold = thresholds[idx]
-                y_pred = (y_proba >= threshold).astype(int)
-                tn, fp, fn, tp = confusion_matrix(y_val, y_pred).ravel()
-
-                threshold_metrics = {
-                    "threshold": threshold,
-                    "fold": fold_idx,
-                    "precision": precisions[idx],
-                    "recall": recalls[idx],
-                    # Key metric: what % of data can we filter while maintaining high recall
-                    "filter_rate": tn / len(y_val),
+    scores = []
+    for setup in tqdm(setups, desc="Trying setups", disable=len(setups) == 1):
+        score, held_out_needed, in_sample_needed = (np.empty(len(ngrams)) for _ in range(3))
+        for train_idx, val_idx, X_train, X_val in fold_data:
+            model = fit_setup(setup, X_train, labels[train_idx])
+            val_scores = model.predict_proba(X_val)[:, 1]
+            train_negative_scores = model.predict_proba(X_train[labels[train_idx] == 0])[:, 1]
+            score[val_idx] = val_scores
+            held_out_needed[val_idx] = pass_rates_needed(val_scores, val_scores[labels[val_idx] == 0])
+            in_sample_needed[val_idx] = pass_rates_needed(val_scores, train_negative_scores)
+        scores.append(
+            pd.DataFrame(
+                {
+                    "setup": setup["name"],
+                    "row": np.arange(len(ngrams)),
+                    "score": score,
+                    "pass_rate_needed": held_out_needed,
+                    "in_sample_pass_rate_needed": in_sample_needed,
                 }
+            )
+        )
 
-                metrics["threshold_metrics"].append(threshold_metrics)
-
-            # For an overall score of each fold model we can use average precision, which apparently is a better fit than
-            # ROCAUC for very imbalanced datasets like mine.
-            # We'll also use the filter rate achieved at different recalls (to be computed after-the-fact), and the
-            # relative std dev of CV fold thresholds
-            metrics["avg_precisions"].append(average_precision_score(y_val, y_proba))
-
-        results.append({**setup_dict, "metrics": metrics})
-        pickle.dump(results, open(results_filepath.as_posix(), "wb"))
-
-    pickle.dump(results, open(results_filepath.as_posix(), "wb"))
-    return results
+    return folds, pd.concat(scores, ignore_index=True)
 
 
-def train_full(
-    ngrams: list[list[str]],
-    sentence_labels: list[int],
-    cv_results: list[dict],
-    model_outdir: Path,
-    critical_recalls: list[float],
-    cv_folds: int,
-):
+def summarize_cliff(scores: pd.DataFrame, labels: np.ndarray, pass_rates=(0.1, 0.25, 0.5)) -> pd.DataFrame:
+    """Positives dropped per setup if every fold model let through a given share of its held-out negatives"""
+    pass_needed = scores[labels[scores.row] == 1].groupby("setup", sort=False).pass_rate_needed
+    return pd.DataFrame({f"dropped at {p:.0%}": pass_needed.apply(lambda q: (q > p).sum()) for p in pass_rates})
+
+
+def exchange_rule(pass_needed: np.ndarray, mu: float = MU) -> float:
     """
-    Selects the best model from CV results and trains it on the full dataset.
+    The pass rate p minimizing p + mu * (share of positives dropped), given the positives' held-out pass rates needed.
 
-    Args:
-        ngrams: ngrams to use for training
-        sentence_labels: int labels for each sentence
-        cv_results: List of CV result dicts from train_cv()
-        model_outdir: Directory to save final model and vectorizer
-        critical_recalls: List of recall levels used in CV
-        cv_folds: Number of CV folds used
+    BERT compute is linear in the pass rate, so this prices it linearly. Every case runs on every document, so total
+    compute is the sum of the cases' pass rates, and minimizing that sum plus mu times the sum of the shares dropped
+    splits into this same choice per case. The same mu everywhere means every case stops where its last point of pass
+    rate buys the same recall. In a nested simulation this matched a pass-rate ceiling on mean recall (at the same mean
+    pass rate), but its worst case kept 85% of positives where the ceiling's kept 70%.
+
+    Only pass rates where a positive sits right on the edge are candidates, since anything in between costs more pass
+    rate for the same recall
     """
-    # Summarize CV results into DataFrame
-    res_df = summarize_all_metrics(cv_results, critical_recalls, cv_folds)
+    candidates = np.unique(np.append(pass_needed, 1.0))[::-1]  # Loosest first, so ties keep more positives
+    dropped = (pass_needed[None, :] > candidates[:, None]).mean(axis=1)
+    return float(candidates[np.argmin(candidates + mu * dropped)])
 
-    # Calculate score for models factoring filter rate and threshold stability, select best model
-    res_df["score"] = res_df["recall100_filterrate"] + (1 - res_df["recall100_threshold_rel_std"])
-    res_df = res_df.sort_values("score", ascending=False)
-    best_model = res_df.iloc[0]
 
-    # Log top 3 for reference
-    logger.info("Top 3 models by score:")
-    display_cols = [
-        "model_class_name",
-        "rebalance_to",
-        "score",
-        "recall100_filterrate",
-        "recall100_threshold_rel_std",
-        "avg_precision",
-    ]
-    for i, (idx, row) in enumerate(res_df.head(3).round(4).iterrows()):
-        logger.info(f"    {i + 1}. {row[display_cols].to_dict()}")
+def expected_recall(pass_needed: np.ndarray, pass_rate: float) -> float:
+    """
+    The share of new positives kept at a pass rate that was picked from these positives' pass rates needed, e.g. by
+    exchange_rule. The share of these positives kept is optimistic: the picked pass rate is always exactly one of
+    theirs, so that positive is kept by construction. For a new positive, the chance of needing more is
+    (d + 1) / (n + 1) on average, with d of the n dropped. In a nested simulation over all cases, this came within half
+    a point of the realized mean recall, vs. 2 points for the share kept.
+    """
+    if pass_rate >= 1:
+        return 1.0
+    return float(1 - ((pass_needed > pass_rate).sum() + 1) / (len(pass_needed) + 1))
 
-    if res_df.iloc[0].recall100_threshold_rel_std >= 0.2:
-        raise ValueError("Model does not have stable enough CV fold thresholds to trust")
-    logger.info("Selecting best model and training on full dataset")
 
-    # Extract model configuration directly from DataFrame
-    model_class = best_model["model_class"]
-    model_kwargs = best_model["model_kwargs"]
-    rebalance_to = best_model["rebalance_to"]
-
-    # Create and fit vectorizer
-    vectorizer = make_vectorizer()
-    sentence_vectors = vectorizer.fit_transform(ngrams)
-    logger.info(f"Vectorized shape: {sentence_vectors.shape}")
-
-    # Apply rebalancing if needed (same logic as train_cv)
-    X_train = sentence_vectors
-    y_train = sentence_labels
-
-    if rebalance_to is not None and pd.notna(rebalance_to):
-        pos_idx = np.where(y_train == 1)[0]
-        neg_idx = np.where(y_train == 0)[0]
-
-        target_ratio = min(int(rebalance_to), len(neg_idx) // len(pos_idx))
-        neg_sample_size = int(len(pos_idx) * target_ratio)
-
-        neg_sample_idx = np.random.choice(neg_idx, size=neg_sample_size, replace=False)
-        balanced_idx = np.concatenate([pos_idx, neg_sample_idx])
-        np.random.shuffle(balanced_idx)
-
-        X_train = X_train[balanced_idx]
-        y_train = y_train[balanced_idx]
-        logger.info(f"Rebalanced: {len(pos_idx)} pos, {len(neg_sample_idx)} neg (1:{target_ratio} ratio)")
-
-    logger.info(f"Training final {model_class.__name__} on full dataset...")
-    final_model = model_class(**model_kwargs)
-    final_model.fit(X_train, y_train)
-
-    # Calculate recommended threshold for 100% recall, being conservative with mean - 0.2 * std
-    threshold_mean = np.mean(best_model["recall100_thresholds"])
-    threshold_std = np.std(best_model["recall100_thresholds"])
-    recommended_threshold = threshold_mean - 0.2 * threshold_std
-    logger.info(f"Mean threshold: {threshold_mean:.4f}, recommended threshold: {recommended_threshold:.4f}")
-
-    # STEP 10: Save artifacts
-    logger.info(f"Saving model artifacts to {model_outdir}...")
-
-    pickle.dump(vectorizer, open((model_outdir / "vectorizer.pkl").as_posix(), "wb"))
-    pickle.dump(final_model, open((model_outdir / "model.pkl").as_posix(), "wb"))
-    pickle.dump(res_df, open((model_outdir / "cv_summary.pkl").as_posix(), "wb"))
-
-    final_metrics = {
-        "threshold": recommended_threshold,
-        "recall100_filterrate": best_model["recall100_filterrate"],
-        "recall100_threshold_rel_std": best_model["recall100_threshold_rel_std"],
-        "score": best_model["score"],
-        "avg_precision": best_model["avg_precision"],
+def choose_pass_rate(cv: pd.DataFrame, mu: float = MU) -> dict[str, float]:
+    """
+    cv: one setup's train_cv scores, with a label column. Returns:
+        pass_rate: exchange_rule's pick, from the positives' held-out pass rates needed
+        overshoot: the fold models' pass rate on their held-out negatives, when each one's threshold is set to let
+            through pass_rate of its own training negatives, relative to pass_rate. Models score the negatives they
+            trained on a little lower than unseen ones, so this is usually above 1
+        in_sample_pass_rate: pass_rate / overshoot, what the full model should let through of its own training
+            negatives to let through pass_rate of unseen ones. In a nested simulation over all cases, this landed at
+            0.99x pass_rate on average (0.89-1.09x per case), vs. 1.12x without the correction
+        n_pos, n_neg
+        cv_dropped: positives whose held-out pass rate needed is above pass_rate
+        expected_recall: see expected_recall
+    """
+    positives, negatives = cv[cv.label == 1], cv[cv.label == 0]
+    pass_rate = exchange_rule(positives.pass_rate_needed.values, mu)
+    overshoot = 1.0
+    if 0 < pass_rate < 1:
+        through = (negatives.in_sample_pass_rate_needed <= pass_rate).mean()
+        if through > 0:
+            overshoot = float(through / pass_rate)
+        else:
+            logger.warning(
+                f"No held-out negatives get through at an in-sample pass rate of {pass_rate}, not correcting"
+            )
+    return {
+        "pass_rate": pass_rate,
+        "overshoot": overshoot,
+        "in_sample_pass_rate": min(pass_rate / overshoot, 1.0),
+        "n_pos": len(positives),
+        "n_neg": len(negatives),
+        "cv_dropped": int((positives.pass_rate_needed > pass_rate).sum()),
+        "expected_recall": expected_recall(positives.pass_rate_needed.values, pass_rate),
     }
-    pickle.dump(final_metrics, open((model_outdir / "final_metrics.pkl").as_posix(), "wb"))
+
+
+def fit_full(
+    ngrams: list[list[str]], labels: np.ndarray, setup: Setup, in_sample_pass_rate: float
+) -> tuple[Vectorizer, Any, float]:
+    """
+    One vectorizer and model on every sentence, plus the score threshold that lets through in_sample_pass_rate of the
+    model's own training negatives
+    """
+    vectorizer = make_vectorizer()
+    X = vectorizer.fit_transform(ngrams)
+    logger.info(f"Vectorized shape: {X.shape}")
+    model = fit_setup(setup, X, labels)
+    threshold = threshold_for_pass_rate(model.predict_proba(X[labels == 0])[:, 1], in_sample_pass_rate)
+    return vectorizer, model, threshold
 
 
 def make_case_dataset(case_id, positives, negatives):
@@ -504,18 +331,19 @@ def make_case_dataset(case_id, positives, negatives):
 
 
 def prep_datasets(
-    documents, points, services, case_ids, num_negative_docs=600, sents_per_doc=18
+    documents, points, services, case_ids, split="train", num_negative_docs=600, sents_per_doc=18
 ) -> tuple[dict[int, pd.DataFrame], pd.DataFrame]:
     """
+    :param split: make_classification_datasets.service_split's "train" or "test"
     :return: make dataframes that can later be refined into datasets of sentences for any Case:
         1) dict from case_id to df of positive instances
         2) a huge dataframe of sentences that can be used as negative instances, with a `offlimits_cases` field
             so I can filter out sentences when they were positive points
     """
-    # Train split only. Points are assigned via their document's service, as in make_classification_datasets
+    # Points are assigned via their document's service, as in make_classification_datasets
     doc_split = documents.service_id.map(make_classification_datasets.service_split)
-    documents = documents[doc_split == "train"]
-    points = points[points.document_id.map(doc_split) == "train"]
+    documents = documents[doc_split == split]
+    points = points[points.document_id.map(doc_split) == split]
 
     documents = documents[documents.lang == "en"]
     points = points[points.lang == "en"].copy()
@@ -545,8 +373,10 @@ def prep_datasets(
         approved["point_id"] = approved["id"]
         positives[case_id] = approved[["point_id", "case_id", "quote_start", "quote_end", "document_id", "text"]]
 
-    # The train split alone can have fewer eligible docs than num_negative_docs
+    # One split alone can have fewer eligible docs than num_negative_docs
     num_negative_docs = min(num_negative_docs, len(documents))
+    # Its own generator, so each split's sentences don't depend on whether the other was prepped first
+    rng = random.Random(RANDOM_STATE)
     negatives = []
     for i, (doc_id, doc) in tqdm(
         enumerate(documents.sample(num_negative_docs, random_state=RANDOM_STATE).iterrows()), total=num_negative_docs
@@ -563,7 +393,7 @@ def prep_datasets(
             case_points = doc_points[doc_points.case_id == case_id]
             case_offlimits[case_id] = [(int(s), int(e)) for s, e in zip(case_points.quote_start, case_points.quote_end)]
 
-        random.shuffle(doc_sents)
+        rng.shuffle(doc_sents)
         for sent in doc_sents[:sents_per_doc]:
             if sent.text != "" and not sent.text.isspace():
                 offlimits_cases = []
@@ -587,10 +417,7 @@ def prep_datasets(
     return positives, pd.DataFrame(negatives)
 
 
-def extract_ngrams(case_dataset):
-    # Shuffle
-    case_dataset = case_dataset.sample(n=len(case_dataset), random_state=RANDOM_STATE)
-
+def extract_ngrams(case_dataset: pd.DataFrame) -> list[list[str]]:
     # Process text into ngrams
     logger.info("Loading spacy model and extracting ngrams")
     # Disable all components except tokenizer for faster ngram extraction
@@ -600,74 +427,120 @@ def extract_ngrams(case_dataset):
         for text in tqdm(case_dataset["text"], total=len(case_dataset))
     ]
 
-    sentence_labels = case_dataset.label.values
     s = "\n".join(map(str, ngrams[:5]))
     logger.info(f"ngrams preview: {s}")
-    s = "\n".join(map(str, [ngrams[i] for i in np.where(sentence_labels)[0][:5]]))
+    s = "\n".join(map(str, [ngrams[i] for i in np.where(case_dataset.label.values)[0][:5]]))
     logger.info(f"ngrams preview (pos only): {s}")
 
-    return ngrams, sentence_labels, case_dataset.service_id.values
+    return ngrams
 
 
-def run(skip_existing=False):
+def run(case_ids: list[int] | None = None, skip_existing=False, compare_setups=False):
     # Same cases the deep learning models are trained on (see sent_spans/train.py)
-    case_ids = sorted(make_classification_datasets.load_sent_span().keys())
+    all_case_ids = sorted(make_classification_datasets.load_sent_span().keys())
+    if case_ids is None:
+        case_ids = all_case_ids
+    elif unknown := set(case_ids) - set(all_case_ids):
+        raise ValueError(f"No sent_span datasets for cases {sorted(unknown)}")
 
     documents = pickle.load(open(here / f"../data/db_dumps/{DB_DUMP_VERSION}/documents_clean.pkl", "rb"))
     points = pickle.load(open(here / f"../data/db_dumps/{DB_DUMP_VERSION}/points_clean.pkl", "rb"))
     services = pickle.load(open(here / f"../data/db_dumps/{DB_DUMP_VERSION}/services_clean.pkl", "rb"))
 
-    # Create cache and results directories
+    # Try to load cached prep_datasets results, which cover all cases even when only some are run
     cache_dir = Path(here / "../data/tfidf")
     cache_dir.mkdir(parents=True, exist_ok=True)
+    datasets = {}
+    for split in ["train", "test"]:
+        prep_cache = cache_dir / f"{DB_DUMP_VERSION}_{MODEL_VERSION}_{split}_datasets_cache.pkl"
+        try:
+            datasets[split] = pickle.load(open(prep_cache, "rb"))
+            logger.info(f"Loaded {split} prep_datasets from cache")
+            missing = set(all_case_ids) - set(datasets[split][0].keys())
+            if missing:
+                logger.info(f"Cache is missing cases {sorted(missing)}, rebuilding")
+                raise FileNotFoundError
+        except FileNotFoundError:
+            logger.info(f"Running {split} prep_datasets (this may take a while)")
+            datasets[split] = prep_datasets(documents, points, services, all_case_ids, split)
+            pickle.dump(datasets[split], open(prep_cache, "wb"))
+    positives, negatives = datasets["train"]
 
-    # Try to load cached prep_datasets result
-    prep_cache = cache_dir / f"{DB_DUMP_VERSION}_{MODEL_VERSION}_datasets_cache.pkl"
-    try:
-        positives, negatives = pickle.load(open(prep_cache, "rb"))
-        logger.info("Loaded prep_datasets from cache")
-        missing = set(case_ids) - set(positives.keys())
-        if missing:
-            logger.info(f"Cache is missing cases {sorted(missing)}, rebuilding")
-            raise FileNotFoundError
-    except FileNotFoundError:
-        logger.info("Running prep_datasets (this may take a while)")
-        positives, negatives = prep_datasets(documents, points, services, case_ids)
-        pickle.dump((positives, negatives), open(prep_cache, "wb"))
-
-    critical_recalls = [1.0, 0.98, 0.95]
-
-    # Loop over all cases
+    shipped_setup = next(setup for setup in gen_setups() if setup["name"] == SHIPPED_SETUP)
+    setups = list(gen_setups()) if compare_setups else [shipped_setup]
     for case_id in case_ids:
-        model_outdir = model_output_dir(case_id)
-        if skip_existing and model_outdir.exists():
-            logger.info(f"Skipping case {case_id}: {model_outdir} already exists")
+        out_dir = model_output_dir(case_id)
+        if skip_existing and (out_dir / "final_metrics.pkl").exists():
+            logger.info(f"Skipping case {case_id}: {out_dir} already exists")
             continue
         logger.info(f"Processing case {case_id}")
 
-        # Create dataset for this case
+        # Create dataset for this case, shuffled
         case_dataset: pd.DataFrame = make_case_dataset(case_id, positives, negatives)
+        case_dataset = case_dataset.sample(n=len(case_dataset), random_state=RANDOM_STATE).reset_index(drop=True)
         # For grouping CV folds (see train_cv)
         case_dataset["service_id"] = case_dataset.document_id.map(documents.service_id)
-        ngrams, sentence_labels, service_ids = extract_ngrams(case_dataset)
+        ngrams = extract_ngrams(case_dataset)
+        labels = case_dataset.label.values
 
-        # Train and save results
-        model_outdir.mkdir(parents=True, exist_ok=True)
-        cv_folds = 5
-        cv_results = train_cv(ngrams, sentence_labels, service_ids, model_outdir, critical_recalls, cv_folds)
-        logger.info(f"Completed CV for case {case_id}")
+        folds, scores = train_cv(ngrams, labels, case_dataset.service_id.values, setups)
+        if compare_setups:
+            logger.info(
+                f"Positives dropped at a given held-out pass rate, case {case_id}:\n{summarize_cliff(scores, labels)}"
+            )
+            # The notebook only plots positives
+            setup_scores = scores[labels[scores.row] == 1].merge(
+                case_dataset[["point_id"]].assign(fold=folds), left_on="row", right_index=True
+            )
+            setups_output_path(case_id).parent.mkdir(parents=True, exist_ok=True)
+            setup_scores.to_pickle(setups_output_path(case_id))
 
-        # Train final model on full dataset
-        train_full(ngrams, sentence_labels, cv_results, model_outdir, critical_recalls, cv_folds)
-        logger.info(f"Completed full training for case {case_id}")
+        # Text is left out to keep this small: the notebook joins positives' text from points_clean by point_id
+        cv = (
+            case_dataset[["label", "point_id", "document_id", "service_id"]]
+            .assign(fold=folds)
+            .join(scores[scores.setup == SHIPPED_SETUP].drop(columns="setup").set_index("row"))
+        )
+        final_metrics = choose_pass_rate(cv)
+        vectorizer, model, threshold = fit_full(ngrams, labels, shipped_setup, final_metrics["in_sample_pass_rate"])
+        final_metrics |= {"threshold": threshold, "setup": SHIPPED_SETUP, "mu": MU}
+        logger.info(
+            f"Case {case_id}: target pass rate {final_metrics['pass_rate']:.2%}, "
+            f"{final_metrics['cv_dropped']} of {final_metrics['n_pos']} positives dropped in CV, "
+            f"expected recall {final_metrics['expected_recall']:.1%}, overshoot {final_metrics['overshoot']:.2f}, "
+            f"threshold {threshold:.4f}"
+        )
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        pickle.dump(vectorizer, open(out_dir / "vectorizer.pkl", "wb"))
+        pickle.dump(model, open(out_dir / "model.pkl", "wb"))
+        pickle.dump(final_metrics, open(out_dir / "final_metrics.pkl", "wb"))
+        cv.to_pickle(out_dir / "cv.pkl")
+
+        # For information only (see the docstring at the top)
+        test_dataset = make_case_dataset(case_id, *datasets["test"])
+        test_dataset["service_id"] = test_dataset.document_id.map(documents.service_id)
+        test_scores = model.predict_proba(vectorizer.transform(extract_ngrams(test_dataset)))[:, 1]
+        test = test_dataset[["label", "point_id", "document_id", "service_id"]].assign(score=test_scores)
+        test.to_pickle(out_dir / "test.pkl")
+        test_through = test.score >= threshold
+        logger.info(
+            f"Case {case_id} on the test split: pass rate {test_through[test.label == 0].mean():.2%}, "
+            f"recall {test_through[test.label == 1].mean():.1%} of {(test.label == 1).sum()} positives"
+        )
+        logger.info(f"Saved case {case_id} to {out_dir}")
 
 
 if __name__ == "__main__":
-    parser = ArgumentParser(description="Train TF-IDF prefilter models for each case")
+    parser = ArgumentParser(description="Train a TF-IDF prefilter model for each case")
+    parser.add_argument("--cases", type=int, nargs="+", help="Case ids to run (default: all)")
     parser.add_argument(
-        "--skip_existing",
+        "--skip_existing", action="store_true", help=f"Skip cases already in data/models/{MODEL_VERSION}"
+    )
+    parser.add_argument(
+        "--compare_setups",
         action="store_true",
-        help=f"Skip cases whose model dir (data/models/{MODEL_VERSION}/{{case_id}}) already exists",
+        help=f"Also cross-validate the rest of gen_setups for the notebook (to data/tfidf/{MODEL_VERSION}/setups)",
     )
     args = parser.parse_args()
-    run(skip_existing=args.skip_existing)
+    run(case_ids=args.cases, skip_existing=args.skip_existing, compare_setups=args.compare_setups)
