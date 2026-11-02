@@ -36,7 +36,7 @@ BASE_MODEL_NAME = "bert-base-uncased"
 MODEL_VERSION = "v3"
 # The TF-IDF prefilter version (tfidf.py) the production case models were evaluated with. Update alongside
 # MODEL_VERSION: v4 models go with tfidf_v3
-PREFILTER_VERSION = "tfidf_v2"
+PREFILTER_VERSION = "tfidf_v3"
 
 # The operating point apply_docbot uses from each case's thresholds.json menu (see sent_spans/thresholds.py).
 # Other consumers (e.g. auto-approval) can request a precision tier like "precision90" instead.

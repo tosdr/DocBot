@@ -10,15 +10,11 @@ outscore. --include_training_data adds train-split negatives, whose scores are i
 (hence ranking against test positives only), and declined docs are under-flagged since their declined passages were
 training examples. Reviewed docs are only lightly affected, as training sees a couple of random passages from each.
 
---cv_predictions reads a cross-validation run's out-of-fold predictions instead (v4 predates the single train/test
-split). Every doc there was scored by a fold model that never trained on it, but fold models score on different scales,
-so negatives are ranked against their own fold's positives.
-
 Each row links to where it can be fixed on edit.tosdr.org: the doc's pending or declined points for the case when it
 has any (e.g. Docbot v3 suggestions awaiting curation), otherwise the service's annotate view. Point statuses are as of
 the DB dump the datasets were built from (make_classification_datasets.DB_DUMP_VERSION).
 
-    uv run python -m src.audit_comprehensive_negatives --model_version v4
+    uv run python -m src.audit_comprehensive_negatives --model_version v4.5
 """
 
 import html
@@ -39,7 +35,7 @@ logger = logging.getLogger(__name__)
 here = Path(__file__).parent
 
 EDIT_URL = "https://edit.tosdr.org"
-# Keep negatives that outscore at least this share of their reference positives (see flag_negatives)
+# Keep negatives that outscore at least this share of the case's test positives (see flag_negatives)
 MIN_BEATS_POS = 0.75
 NEGATIVE_SOURCES = ["reviewed", "declined"]
 MAX_PASSAGE_CHARS = 500
@@ -56,43 +52,34 @@ def _plain(text: str, max_chars: int) -> str:
 
 
 def flag_negatives(
-    doc_results: dict[int, pd.DataFrame],
-    min_beats_pos: float,
-    sources: list[str],
-    include_training_data: bool,
-    cross_validated: bool,
+    doc_results: dict[int, pd.DataFrame], min_beats_pos: float, sources: list[str], include_training_data: bool
 ) -> pd.DataFrame:
     """
     :param doc_results: doc predictions by case (train.py output), each with a `split` column
-    :param cross_validated: the predictions are a cross-validation run's out-of-fold scores, so negatives are ranked
-        against their own fold's positives. Otherwise one model scored everything, and negatives are ranked against the
-        case's test positives, the only ones the model never trained on.
-    :return: one row per negative doc outscoring at least `min_beats_pos` of its reference positives, with that share
-        (`beats_pos`) and the passage the model scored highest
+    :return: one row per negative doc outscoring at least `min_beats_pos` of the case's test positives (the only ones
+        the model never trained on), with that share (`beats_pos`) and the passage the model scored highest
     """
     frames = []
     for case_id, df in doc_results.items():
         df = df[df.pred_score.notna()]
-        for _, group in df.groupby("fold") if cross_validated else [(None, df)]:
-            reference = group if cross_validated else group[group.split == "test"]
-            pos = np.sort(reference[reference.label == "positive"].pred_score.values)
-            neg = group[(group.label == "negative") & group.source.isin(sources)]
-            if not include_training_data:
-                neg = neg[neg.split == "test"]
-            if len(pos) == 0 or len(neg) == 0:
-                continue
-            beats_pos = np.searchsorted(pos, neg.pred_score.values, side="left") / len(pos)
-            keep = beats_pos >= min_beats_pos
-            flagged = neg[keep].copy()
-            flagged["case_id"] = int(case_id)
-            flagged["beats_pos"] = beats_pos[keep]
-            flagged["passage"] = [
-                _plain(text[int(start) : int(end)], MAX_PASSAGE_CHARS) if pd.notna(start) and pd.notna(end) else ""
-                for text, start, end in zip(flagged.text, flagged.pred_char_start, flagged.pred_char_end)
-            ]
-            frames.append(
-                flagged[["case_id", "id_doc", "id_service", "source", "split", "pred_score", "beats_pos", "passage"]]
-            )
+        pos = np.sort(df[(df.split == "test") & (df.label == "positive")].pred_score.values)
+        neg = df[(df.label == "negative") & df.source.isin(sources)]
+        if not include_training_data:
+            neg = neg[neg.split == "test"]
+        if len(pos) == 0 or len(neg) == 0:
+            continue
+        beats_pos = np.searchsorted(pos, neg.pred_score.values, side="left") / len(pos)
+        keep = beats_pos >= min_beats_pos
+        flagged = neg[keep].copy()
+        flagged["case_id"] = int(case_id)
+        flagged["beats_pos"] = beats_pos[keep]
+        flagged["passage"] = [
+            _plain(text[int(start) : int(end)], MAX_PASSAGE_CHARS) if pd.notna(start) and pd.notna(end) else ""
+            for text, start, end in zip(flagged.text, flagged.pred_char_start, flagged.pred_char_end)
+        ]
+        frames.append(
+            flagged[["case_id", "id_doc", "id_service", "source", "split", "pred_score", "beats_pos", "passage"]]
+        )
     return pd.concat(frames, ignore_index=True)
 
 
@@ -178,33 +165,19 @@ summary .muted { font-weight: 400; }
 """
 
 
-def _column_notes(include_training_data: bool, cross_validated: bool) -> str:
-    if cross_validated:
-        outscores = (
-            "the share of positive docs (from the same cross-validation fold) that this negative scores above. It's "
-            "the sort key, because each fold's model scores on its own scale; the raw <b>score</b> is for reference."
-        )
-    else:
-        outscores = (
-            "the share of the case's test-split positive docs that this negative scores above. It's the sort key; the "
-            "raw <b>score</b> is for reference."
-        )
+def _column_notes(include_training_data: bool) -> str:
     split = ""
     if include_training_data:
         split = (
             "<li><b>Split</b>: <i>test</i> docs decide the shipped thresholds, so fix those first. <i>train</i> docs "
-            "help the next model train on cleaner labels."
-            + (
-                ""
-                if cross_validated
-                else " Their scores come from the model that trained on them, so declined docs especially are "
-                "under-flagged. <i>stop</i> docs are train-split docs held out for early stopping, scored honestly."
-            )
-            + "</li>"
+            "help the next model train on cleaner labels. Their scores come from the model that trained on them, so "
+            "declined docs especially are under-flagged. <i>stop</i> docs are train-split docs held out for early "
+            "stopping, scored honestly.</li>"
         )
     return f"""
 <ul>
-  <li><b>Outscores</b>: {outscores}</li>
+  <li><b>Outscores</b>: the share of the case's test-split positive docs that this negative scores above. It's the sort
+    key; the raw <b>score</b> is for reference.</li>
   <li><b>Source</b>: <i>reviewed</i> docs are from comprehensively reviewed services and have no point for the case;
     <i>declined</i> docs have a point for the case that a curator declined.</li>
   {split}
@@ -256,12 +229,7 @@ def _counts(case_df: pd.DataFrame) -> dict[str, int]:
 
 
 def render_html(
-    flagged: pd.DataFrame,
-    cases: pd.DataFrame,
-    model_version: str,
-    min_beats_pos: float,
-    include_training_data: bool,
-    cross_validated: bool,
+    flagged: pd.DataFrame, cases: pd.DataFrame, model_version: str, min_beats_pos: float, include_training_data: bool
 ) -> str:
     split_header = "<th>Split</th>" if include_training_data else ""
     index_rows, sections = [], []
@@ -289,9 +257,7 @@ def render_html(
     totals = _counts(flagged)
     total_counts = ", ".join(f"{n} {action}" for action, n in totals.items() if n)
     scope = "test and train splits" if include_training_data else "test split"
-    if cross_validated:
-        scoring = "Scores are cross-validated: each doc was scored by a fold model that never trained on it."
-    elif include_training_data:
+    if include_training_data:
         scoring = (
             "Test docs were scored by a model that never trained on them; train docs by the model that trained on "
             "them, which may have partly fit their labels."
@@ -314,7 +280,7 @@ def render_html(
 <p>These docs are labeled negative for a case, yet the {model_version} model scores them above at least
   {min_beats_pos:.0%} of the case's positive docs. A few of them per case are enough to cap recall at high
   precision, and many are missed points. Within each case they're sorted worst first. {scoring}</p>
-{_column_notes(include_training_data, cross_validated)}
+{_column_notes(include_training_data)}
 </div>
 <h2>Cases</h2>
 <div class="scroll"><table>
@@ -328,34 +294,20 @@ def render_html(
 """
 
 
-def run(
-    model_version: str,
-    min_beats_pos: float,
-    sources: list[str],
-    include_training_data: bool = False,
-    cross_validated: bool = False,
-) -> Path:
+def run(model_version: str, min_beats_pos: float, sources: list[str], include_training_data: bool = False) -> Path:
     training_dir = here / f"../data/training/{model_version}"
-    doc_pred_path = training_dir / ("cv/doc_pred.pkl" if cross_validated else "doc_pred.pkl")
-    if not doc_pred_path.exists() and not cross_validated and (training_dir / "cv/doc_pred.pkl").exists():
-        raise FileNotFoundError(
-            f"{doc_pred_path} not found, but {model_version} has cross-validation predictions: pass --cv_predictions"
-        )
+    doc_pred_path = training_dir / "doc_pred.pkl"
     logger.info(f"Loading doc predictions from {doc_pred_path}")
     with open(doc_pred_path, "rb") as f:
         doc_results: dict[int, pd.DataFrame] = pickle.load(f)
 
     for df in doc_results.values():
-        if cross_validated:
-            # Cross-validation predictions predate the split column; it's a pure function of the service
-            df["split"] = df.id_service.map(make_classification_datasets.service_split)
-        else:
-            # Train-split docs held out for early stopping were scored honestly, unlike the rest of the train split
-            df.loc[df.stopping_slice, "split"] = "stop"
+        # Train-split docs held out for early stopping were scored honestly, unlike the rest of the train split
+        df.loc[df.stopping_slice, "split"] = "stop"
 
-    flagged = flag_negatives(doc_results, min_beats_pos, sources, include_training_data, cross_validated)
+    flagged = flag_negatives(doc_results, min_beats_pos, sources, include_training_data)
     del doc_results  # the doc text makes this several GB
-    logger.info(f"{len(flagged)} negatives outscore >= {min_beats_pos:.0%} of their reference positives")
+    logger.info(f"{len(flagged)} negatives outscore >= {min_beats_pos:.0%} of their case's test positives")
     logger.info(f"By split: {flagged.split.value_counts().to_dict()}")
 
     cases, documents, points = make_classification_datasets.load_clean_dumps()
@@ -364,9 +316,7 @@ def run(
 
     suffix = "_with_train" if include_training_data else ""
     out_path = (training_dir / f"comprehensive_negatives_audit{suffix}.html").resolve()
-    out_path.write_text(
-        render_html(flagged, cases, model_version, min_beats_pos, include_training_data, cross_validated)
-    )
+    out_path.write_text(render_html(flagged, cases, model_version, min_beats_pos, include_training_data))
     logger.info(f"Wrote {out_path}")
     return out_path
 
@@ -387,16 +337,10 @@ if __name__ == "__main__":
         "only the test split, whose labels decide the shipped thresholds, is audited",
     )
     parser.add_argument(
-        "--cv_predictions",
-        action="store_true",
-        help="Read a cross-validation run's out-of-fold predictions (data/training/{model_version}/cv/doc_pred.pkl, "
-        "e.g. v4's) instead of the single-split output",
-    )
-    parser.add_argument(
         "--min_beats_pos",
         type=float,
         default=MIN_BEATS_POS,
-        help="Keep negatives scoring above at least this share of their reference positives",
+        help="Keep negatives scoring above at least this share of the case's test positives",
     )
     parser.add_argument(
         "--sources", type=str, default=",".join(NEGATIVE_SOURCES), help="Comma-separated negative sources to include"
@@ -407,5 +351,4 @@ if __name__ == "__main__":
         args.min_beats_pos,
         args.sources.split(","),
         include_training_data=args.include_training_data,
-        cross_validated=args.cv_predictions,
     )

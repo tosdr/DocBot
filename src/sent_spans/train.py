@@ -851,7 +851,7 @@ if __name__ == "__main__":
         "(data/training/{model_version}/) and the S3 prefix for uploads. Omit for throwaway experiments, which "
         "cache under a timestamp instead. Required with --upload or --parallel",
     )
-    parser.add_argument("--batch_size", type=int, default=32, help="Default is ideal for 24gb GPU memory")
+    parser.add_argument("--batch_size", type=int, default=92, help="Default is ideal for 24gb GPU memory")
     parser.add_argument("--learning_rate", type=float, default=5e-04)
     parser.add_argument(
         "--attempts",
